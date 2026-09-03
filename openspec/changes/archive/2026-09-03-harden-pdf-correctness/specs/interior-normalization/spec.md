@@ -108,17 +108,17 @@ Normalization SHALL support shifting content toward the outer edge by the produc
 
 When the shift would move content outside the trim or safety rectangle, normalization SHALL report a warning naming the affected pages, because the shift is applied to already-laid-out content whose margins the tool does not control.
 
-#### Scenario: Recto and verso shift in opposite directions
+#### Scenario: Odd and even pages shift in opposite directions
 
 - **WHEN** a 200-page interior is normalized with the gutter shift enabled
 - **THEN** odd pages shift toward increasing x and even pages toward decreasing x, each by the band's gutter width
 
-#### Scenario: Gutter is off unless requested
+#### Scenario: Gutter shift is off by default
 
 - **WHEN** an interior is normalized without requesting the gutter shift
 - **THEN** no page is shifted and the report says the gutter was not applied
 
-#### Scenario: A shift that pushes content off the trim is reported
+#### Scenario: Gutter shift pushes content off the trim
 
 - **WHEN** the gutter shift would move content on a page beyond the trim rectangle
 - **THEN** the report carries a warning naming those pages and the amount by which content exceeds the safe area
@@ -128,6 +128,18 @@ When the shift would move content outside the trim or safety rectangle, normaliz
 Normalization SHALL remove from the output every structure Lulu prohibits or that carries no print meaning: encryption, all annotations, all form fields and the `AcroForm` dictionary, document-level and annotation-level JavaScript, embedded files, multimedia and 3D artwork, and any `PageLayout` requesting spreads.
 
 The document catalog's `/Names` tree SHALL be resolved and modified whether it is written as a direct dictionary or an indirect reference, so that JavaScript and embedded files are genuinely removed in both encodings. The summary of what was removed SHALL reflect what was actually removed.
+
+Where a source PDF is encrypted with an empty user password, normalization SHALL decrypt it. Where it is encrypted with a real user password, normalization SHALL fail with an error asking for the password rather than producing a partially readable file.
+
+#### Scenario: Empty-password encryption is removed
+
+- **WHEN** an input PDF is encrypted with an empty user password and an owner password
+- **THEN** the output is unencrypted and the report records that encryption was removed
+
+#### Scenario: Password-protected input is refused
+
+- **WHEN** an input PDF requires a user password that the caller has not supplied
+- **THEN** normalization fails with an error stating that the password is required, and writes no output
 
 #### Scenario: Annotations and scripts are stripped
 

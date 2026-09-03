@@ -141,20 +141,25 @@ These SHALL be evaluated over the page's own content stream and over the content
 
 Each distinct condition SHALL carry its own stable finding code, so that a consumer filtering or suppressing by code cannot conflate two unrelated conditions.
 
-#### Scenario: Total area coverage over the limit
+#### Scenario: Total ink coverage too high
 
-- **WHEN** a page fills an area with CMYK values totalling 320%
-- **THEN** preflight reports a warning naming the observed coverage and Lulu's 270% limit
+- **WHEN** a CMYK fill on a page sums to 300 percent coverage
+- **THEN** preflight reports a warning naming the page, the observed 300 percent, and Lulu's 270 percent ceiling
+
+#### Scenario: Spot colour is reported
+
+- **WHEN** a page uses a Separation or DeviceN colour space
+- **THEN** preflight reports a warning naming the colour space and the pages that use it
 
 #### Scenario: Live transparency is reported
 
-- **WHEN** a page's graphics state carries a soft mask or a non-normal blend mode
-- **THEN** preflight reports a warning that transparency must be flattened
+- **WHEN** a page's resources declare a soft mask or a non-Normal blend mode
+- **THEN** preflight reports a warning that transparency is unflattened and names flattening as the remedy
 
-#### Scenario: Layers are reported
+#### Scenario: Optional content is reported
 
-- **WHEN** the document catalog declares optional content groups
-- **THEN** preflight reports a warning that layers must be flattened
+- **WHEN** the document declares an `/OCProperties` dictionary
+- **THEN** preflight reports a warning that layers are present and must be flattened
 
 #### Scenario: Colour inside a form XObject is inspected
 
@@ -172,15 +177,20 @@ Preflight SHALL report the structures Lulu prohibits or ignores: encryption of a
 
 The document catalog's `/Names` tree SHALL be resolved whether it is written as a direct dictionary or an indirect reference, so that JavaScript and embedded files are found in both encodings.
 
-#### Scenario: Annotations are reported with their subtypes
+#### Scenario: Encrypted file is blocking
 
-- **WHEN** a page carries link and widget annotations
-- **THEN** preflight reports a finding naming each subtype and the pages carrying them
+- **WHEN** the PDF carries an encryption dictionary, even with an empty user password
+- **THEN** preflight reports a blocking finding, since Lulu prohibits security and password protection, and marks it fixable
 
-#### Scenario: Encryption is always blocking
+#### Scenario: Annotations are reported
 
-- **WHEN** a file carries an encryption dictionary, even with an empty user password
-- **THEN** preflight reports a blocking finding, because Lulu accepts no encrypted file
+- **WHEN** pages carry link or text annotations
+- **THEN** preflight reports a warning listing the annotation subtypes and affected pages, and marks them fixable by removal
+
+#### Scenario: Spread layout is reported
+
+- **WHEN** the catalog declares `/PageLayout /TwoPageLeft` or similar
+- **THEN** preflight reports a warning that Lulu requires a single-page layout, and marks it fixable
 
 #### Scenario: JavaScript behind an indirect Names tree is found
 

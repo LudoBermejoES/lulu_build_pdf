@@ -26,11 +26,15 @@ Normalization SHALL never modify the input file in place, and SHALL refuse to ov
 
 ### Requirement: Page geometry transformation
 
-Normalization SHALL place each source page's content onto a new page of the required size with bleed, without resampling raster images or rasterizing vector content, by embedding the source page as a form XObject under an affine transform.
+Normalization SHALL place each source page's content onto a new page of the required size with bleed, without resampling raster images or rasterizing vector content, by embedding the source page as a form XObject under an affine transform, carrying that page's effective resources onto the form.
 
 Three fit modes SHALL be supported. `center` SHALL centre the source content at its original scale, which yields an unprinted 0.125 in border where the source has no bleed. `scale-to-bleed` SHALL scale the source uniformly so it covers the full bleed area, cropping equally on all sides. `stretch-margins` SHALL keep the source at original scale and extend the outermost edge pixels or fill colour into the bleed area. The default SHALL be `center`, because it never alters the position of content relative to the trim edge.
 
+A fit mode SHALL either perform what it documents or be rejected as unimplemented. A mode SHALL NOT silently behave as a different mode.
+
 The output SHALL set `MediaBox`, `CropBox`, and `BleedBox` to the full page including bleed, and `TrimBox` and `ArtBox` to the trim rectangle inset 0.125 in on each side, so downstream tools know where the trim falls.
+
+Rotation SHALL be baked in for every rotation the tool can resolve, including a `/Rotate` written as an indirect reference or a real number. A `/Rotate` that cannot be resolved, or that is not a multiple of 90, SHALL produce a finding rather than being treated as no rotation.
 
 #### Scenario: Centre fit preserves scale and trim position
 
@@ -52,6 +56,16 @@ The output SHALL set `MediaBox`, `CropBox`, and `BleedBox` to the full page incl
 - **WHEN** a source page carries `/Rotate 90`
 - **THEN** the rotation is applied within the transform, the output page carries no `/Rotate` entry, and the visible content orientation is unchanged
 
+#### Scenario: Rotation written as a real number is baked in
+
+- **WHEN** a source page carries `/Rotate 90.0` rather than `/Rotate 90`
+- **THEN** the rotation is baked in identically to the integer form
+
+#### Scenario: A fit mode never silently substitutes another
+
+- **WHEN** the caller selects `stretch-margins`
+- **THEN** either the bleed area is filled as documented, or the run fails stating that the mode is not implemented — the output is never silently identical to `center`
+
 #### Scenario: Boxes are set for the trim
 
 - **WHEN** any page is normalized for a 6 × 9 in product
@@ -59,24 +73,24 @@ The output SHALL set `MediaBox`, `CropBox`, and `BleedBox` to the full page incl
 
 ### Requirement: Gutter shift
 
-When enabled, normalization SHALL shift page content away from the bound edge by the gutter allowance for the final page count, moving odd pages toward the right and even pages toward the left, so that inner-edge content clears the binding.
+Normalization SHALL support shifting content toward the outer edge by the product's gutter allowance for the final page count, in opposite directions on recto and verso pages, and SHALL be off by default so a source that already carries its own gutter is not shifted twice.
 
-The gutter shift SHALL be off by default, because a source laid out with its own gutter would be double-shifted. When enabled, normalization SHALL report the applied offset and warn if any content is thereby pushed outside the trim area.
+When the shift would move content outside the trim or safety rectangle, normalization SHALL report a warning naming the affected pages, because the shift is applied to already-laid-out content whose margins the tool does not control.
 
 #### Scenario: Odd and even pages shift in opposite directions
 
-- **WHEN** the gutter shift is enabled for a 210-page interior, whose gutter allowance is 0.500 in
-- **THEN** odd-numbered pages are shifted 36 pt toward increasing x and even-numbered pages 36 pt toward decreasing x
-
-#### Scenario: Gutter shift pushes content off the trim
-
-- **WHEN** the gutter shift would move existing content outside the trim rectangle
-- **THEN** the operation still completes and the report carries a warning naming the affected pages
+- **WHEN** a 200-page interior is normalized with the gutter shift enabled
+- **THEN** odd pages shift toward increasing x and even pages toward decreasing x, each by the band's gutter width
 
 #### Scenario: Gutter shift is off by default
 
-- **WHEN** normalization runs without the gutter option
-- **THEN** no page is shifted and the report states that gutter compensation was not applied
+- **WHEN** an interior is normalized without requesting the gutter shift
+- **THEN** no page is shifted and the report says the gutter was not applied
+
+#### Scenario: Gutter shift pushes content off the trim
+
+- **WHEN** the gutter shift would move content on a page beyond the trim rectangle
+- **THEN** the report carries a warning naming those pages and the amount by which content exceeds the safe area
 
 ### Requirement: Page count padding
 
@@ -108,6 +122,8 @@ Blank pages SHALL be appended at the end, matching Lulu's own behaviour of addin
 
 Normalization SHALL remove from the output every structure Lulu prohibits or that carries no print meaning: encryption, all annotations, all form fields and the `AcroForm` dictionary, document-level and annotation-level JavaScript, embedded files, multimedia and 3D artwork, and any `PageLayout` requesting spreads.
 
+The document catalog's `/Names` tree SHALL be resolved and modified whether it is written as a direct dictionary or an indirect reference, so that JavaScript and embedded files are genuinely removed in both encodings. The summary of what was removed SHALL reflect what was actually removed.
+
 Where a source PDF is encrypted with an empty user password, normalization SHALL decrypt it. Where it is encrypted with a real user password, normalization SHALL fail with an error asking for the password rather than producing a partially readable file.
 
 #### Scenario: Empty-password encryption is removed
@@ -130,6 +146,11 @@ Where a source PDF is encrypted with an empty user password, normalization SHALL
 - **WHEN** an input declares a two-page spread layout
 - **THEN** the output declares `/PageLayout /SinglePage`
 
+#### Scenario: JavaScript behind an indirect Names tree is removed
+
+- **WHEN** an input's catalog carries `/Names` as an indirect reference to a tree containing `/JavaScript`
+- **THEN** the JavaScript is absent from the output and the report states that it was removed
+
 ### Requirement: Spread splitting
 
 When the caller declares that the source is imposed as two-up spreads, normalization SHALL split each spread page down its vertical centre into two single pages, ordered left page first, before applying page geometry.
@@ -148,7 +169,11 @@ Spread splitting SHALL be opt-in and SHALL NOT be inferred from aspect ratio alo
 
 ### Requirement: Run report
 
-Normalization SHALL emit a report describing every change it made, in the same human and JSON forms as preflight, and SHALL re-run the preflight checks against its own output so the report states the resulting file's conformance.
+Normalization SHALL emit a report describing every change it made, in the same human and JSON forms as preflight.
+
+It SHALL preflight both its input and its own output. The report SHALL state the output file's conformance, and SHALL additionally carry every finding present in the input that normalization did not fix — most importantly the findings it structurally cannot fix, such as an unembedded font. A finding SHALL NOT disappear from the report merely because the transformation moved the content beyond the reach of a check.
+
+A run whose output still carries an unfixed blocking finding SHALL NOT be reported as print-ready.
 
 #### Scenario: Report enumerates the changes
 
@@ -159,4 +184,65 @@ Normalization SHALL emit a report describing every change it made, in the same h
 
 - **WHEN** normalization completes
 - **THEN** the report includes a preflight verdict for the output file, and any finding that normalization could not fix is repeated there with its severity
+
+#### Scenario: An unembedded font survives into the report
+
+- **WHEN** a file whose only defect is an unembedded font is normalized
+- **THEN** the report carries the blocking unembedded-font finding, the run is not reported as print-ready, and the verdict matches what `check` reports for the same input
+
+#### Scenario: A fixed finding is not repeated
+
+- **WHEN** normalization corrects a page-size mismatch that preflight reported on the input
+- **THEN** the report records the correction and does not also carry the input's size-mismatch finding as outstanding
+
+### Requirement: Nesting preserves the source page's effective resources
+
+When normalization embeds a source page as a form XObject, the form's resource dictionary SHALL be the page's *effective* resources: its own `/Resources` whether written directly or as an indirect reference, merged with any `/Resources` inherited from its `Pages` ancestors, with the page's own entries taking precedence.
+
+Normalization SHALL NOT substitute an empty resource dictionary when a page's resources cannot be read. A page whose content stream names resources that cannot be resolved SHALL produce a blocking finding, and normalization SHALL NOT report such an output as print-ready.
+
+#### Scenario: Indirect resources survive nesting
+
+- **WHEN** a page whose `/Resources` is an indirect reference to a dictionary containing its font is normalized
+- **THEN** the generated form XObject carries that font in its resources, and the text renders in the output exactly as in the source
+
+#### Scenario: Inherited resources survive nesting
+
+- **WHEN** a page with no `/Resources` of its own, inheriting one from its `Pages` node, is normalized
+- **THEN** the generated form XObject carries the inherited resources, and the content renders in the output
+
+#### Scenario: A page's own resources win over inherited ones
+
+- **WHEN** a page and its `Pages` ancestor both define a `/Font` entry under the same name, and the page is normalized
+- **THEN** the form's resources resolve that name to the page's own entry
+
+#### Scenario: Unresolvable resources are never reported as print-ready
+
+- **WHEN** a page's content stream names a font that cannot be resolved from any resource dictionary
+- **THEN** normalization reports a blocking finding naming the page and the missing resource, and the run does not report the output as print-ready
+
+### Requirement: Degenerate geometry is refused rather than written
+
+Normalization SHALL refuse a page whose resolved dimensions are not finite and positive, and SHALL NOT write a transform containing a non-finite number.
+
+Every numeric operand written into an output content stream SHALL be verified finite immediately before it is written.
+
+#### Scenario: Zero-sized page is refused
+
+- **WHEN** a page whose box resolves to zero width is normalized with fit mode `scale-to-bleed`
+- **THEN** normalization reports a blocking finding naming that page, and writes no output containing a non-finite operand
+
+#### Scenario: No output ever carries a non-finite operand
+
+- **WHEN** any file is normalized successfully
+- **THEN** every numeric operand in every generated content stream is a finite number
+
+### Requirement: Pages aliased more than once in the page tree are handled correctly
+
+A page object referenced more than once by the page tree SHALL be treated as a distinct output page per occurrence, each transformed independently, and SHALL NOT be transformed repeatedly in place such that transforms compound.
+
+#### Scenario: A page referenced twice yields two correct pages
+
+- **WHEN** a document's `/Kids` references the same page object twice and the document is normalized
+- **THEN** the output contains two pages, each nested exactly once, each carrying the gutter shift for its own page parity
 

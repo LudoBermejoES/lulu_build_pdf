@@ -125,7 +125,7 @@ The narrow-spine warning SHALL be emitted by the cover preparation path, not mer
 - **WHEN** a cover is prepared for a product whose spine is narrower than 0.125 in
 - **THEN** the report carries a warning that the spine is too narrow to hold text reliably given Lulu's binding variance
 
-#### Scenario: Casewrap uses the wider margin measured from the trim
+#### Scenario: Casewrap uses the wider margin
 
 - **WHEN** the product is hardcover case wrap
 - **THEN** the safety margin applied is 0.750 in, measured inward from the trim rectangle, so the safe area begins 0.875 + 0.750 in from the canvas edge
