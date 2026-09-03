@@ -1,0 +1,46 @@
+---
+source: crates/lulu-prep/tests/fixture_snapshots.rs
+expression: report.normalized_for_diff()
+---
+{
+  "catalog_fetch_date": "2026-09-03",
+  "detected_tools": [],
+  "findings": [
+    {
+      "code": "geometry.mixed-page-sizes",
+      "fixable": true,
+      "message": "interior pages are not a uniform size: 6.250 x 9.250 in on page(s) [1, 3]; 6.944 x 9.722 in on page(s) [2]",
+      "pages": [
+        1,
+        2,
+        3
+      ],
+      "severity": "blocking"
+    },
+    {
+      "code": "geometry.page-size-mismatch",
+      "expected": "6.250 x 9.250 in",
+      "fixable": true,
+      "message": "1 page(s) measure 6.944 x 9.722 in but this product requires 6.250 x 9.250 in (0.125 in bleed per side)",
+      "observed": "6.944 x 9.722 in",
+      "pages": [
+        2
+      ],
+      "severity": "blocking"
+    },
+    {
+      "code": "page-count.below-minimum",
+      "expected": ">= 32",
+      "fixable": true,
+      "message": "3 pages is below this product's 32-page minimum; 29 blank page(s) would be appended to reach 32",
+      "observed": "3",
+      "severity": "blocking"
+    }
+  ],
+  "generated_at": null,
+  "page_count": 3,
+  "product_sku": "0600X0900.BW.STD.PB.060UW444.MXX",
+  "schema_version": 1,
+  "stages": [],
+  "tool_version": "0.1.0"
+}

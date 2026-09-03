@@ -1,0 +1,15 @@
+---
+source: crates/lulu-prep/tests/fixture_snapshots.rs
+expression: report.normalized_for_diff()
+---
+{
+  "catalog_fetch_date": "2026-09-03",
+  "detected_tools": [],
+  "findings": [],
+  "generated_at": null,
+  "page_count": 32,
+  "product_sku": "0600X0900.BW.STD.PB.060UW444.MXX",
+  "schema_version": 1,
+  "stages": [],
+  "tool_version": "0.1.0"
+}

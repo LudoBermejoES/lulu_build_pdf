@@ -1,0 +1,35 @@
+---
+source: crates/lulu-prep/tests/fixture_snapshots.rs
+expression: report.normalized_for_diff()
+---
+{
+  "catalog_fetch_date": "2026-09-03",
+  "detected_tools": [],
+  "findings": [
+    {
+      "code": "image.low-resolution",
+      "expected": "300 ppi",
+      "fixable": false,
+      "message": "1 image(s) below the 300 ppi target; the lowest is 100 ppi on page 1 (object (1, 0))",
+      "observed": "100 ppi",
+      "pages": [
+        1
+      ],
+      "severity": "warning"
+    },
+    {
+      "code": "page-count.below-minimum",
+      "expected": ">= 32",
+      "fixable": true,
+      "message": "1 pages is below this product's 32-page minimum; 31 blank page(s) would be appended to reach 32",
+      "observed": "1",
+      "severity": "blocking"
+    }
+  ],
+  "generated_at": null,
+  "page_count": 1,
+  "product_sku": "0600X0900.BW.STD.PB.060UW444.MXX",
+  "schema_version": 1,
+  "stages": [],
+  "tool_version": "0.1.0"
+}

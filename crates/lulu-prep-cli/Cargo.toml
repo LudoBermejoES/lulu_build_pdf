@@ -1,0 +1,27 @@
+[package]
+name = "lulu-prep-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for preparing PDFs for print at Lulu."
+
+[lib]
+name = "lulu_prep_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lulu-prep"
+path = "src/main.rs"
+
+[dependencies]
+lulu-prep.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+camino.workspace = true
+toml = "1"
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+lopdf.workspace = true
+tempfile = "3"

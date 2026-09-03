@@ -1,0 +1,32 @@
+[package]
+name = "lulu-prep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Prepare arbitrary PDFs for print at Lulu: interior normalization, cover geometry, and preflight."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+camino.workspace = true
+sha2.workspace = true
+lopdf.workspace = true
+pdf-writer.workspace = true
+which = "8"
+tempfile = "3"
+
+reqwest = { version = "0.12", features = ["json"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
+lcms2 = { version = "6", optional = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+proptest = "1"
+flate2 = "1"
+wiremock = "0.6"
+
+[features]
+default = []
+lulu-api = ["dep:reqwest", "dep:tokio"]
+icc = ["dep:lcms2"]

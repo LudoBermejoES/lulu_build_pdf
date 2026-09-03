@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/lulu-prep", "crates/lulu-prep-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+lulu-prep = { path = "crates/lulu-prep" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+camino = "1"
+sha2 = "0.10"
+lopdf = "0.44"
+pdf-writer = "0.15"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true
