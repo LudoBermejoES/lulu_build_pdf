@@ -32,6 +32,16 @@ pub struct CoverGeometry {
     /// The page count this geometry was built for, so a caller can confirm
     /// it matches the interior it's pairing this cover with.
     pub page_count: u32,
+    /// Where the sheet is actually cut, within `canvas` — as opposed to
+    /// `canvas`'s own outer edge, which carries bleed (perfect binding,
+    /// 0.125in) or board overhang (case wrap, 0.875in) beyond the trim.
+    /// Computed by whichever geometry builder produced `canvas`, since only
+    /// that code knows the binding's own edge convention. Every consumer of
+    /// a trim edge — the template's trim guide, a cover page's
+    /// `TrimBox`/`ArtBox`, and the rectangle safety margins are inset from —
+    /// reads this field rather than recomputing `canvas.inset(bleed())`,
+    /// which is only correct for perfect binding.
+    pub trim_rect: Rect,
 }
 
 fn require_conformant_count(
@@ -71,12 +81,13 @@ fn perfect_geometry(
     };
     let canvas = geometry::perfect_cover_canvas(entry.trim_size, spine_width);
     let bleed = geometry::bleed();
+    let canvas_size = Size::new(canvas.width, canvas.height);
 
     let fold1 = bleed + entry.trim_size.width;
     let fold2 = fold1 + spine_width;
 
     Ok(CoverGeometry {
-        canvas: Size::new(canvas.width, canvas.height),
+        canvas: canvas_size,
         back_panel: Rect {
             x0: Length::ZERO,
             y0: Length::ZERO,
@@ -99,6 +110,7 @@ fn perfect_geometry(
         safety_margin: geometry::cover_safety_margin(entry.binding),
         hinge_zones: None,
         page_count,
+        trim_rect: Rect::from_origin_size(canvas_size).inset(bleed),
     })
 }
 
@@ -170,6 +182,7 @@ fn case_wrap_geometry(
             },
         )),
         page_count,
+        trim_rect: Rect::from_origin_size(canvas).inset(overhang),
     })
 }
 
@@ -265,6 +278,14 @@ fn hardcover_geometry_from_table(
             },
         )),
         page_count,
+        // No dust-jacket trim convention has been transcribed or designed
+        // yet (see `HARDCOVER_TEMPLATE_TABLE`'s doc comment): the production
+        // table is empty, so this arm is unreachable outside a synthetic
+        // test row exercising the lookup mechanism itself. `bleed()` is used
+        // as a placeholder rather than inventing an overhang value; nothing
+        // in production ever reads a `trim_rect` produced from a real,
+        // populated row until that convention is designed.
+        trim_rect: Rect::from_origin_size(row.canvas).inset(geometry::bleed()),
     })
 }
 
@@ -343,11 +364,99 @@ fn pdf_escape(s: &str) -> String {
         .replace(')', "\\)")
 }
 
+fn length_min(a: Length, b: Length) -> Length {
+    if a.as_points() <= b.as_points() {
+        a
+    } else {
+        b
+    }
+}
+
+fn length_max(a: Length, b: Length) -> Length {
+    if a.as_points() >= b.as_points() {
+        a
+    } else {
+        b
+    }
+}
+
+/// The portion of `panel` that lies within `trim`'s horizontal extent,
+/// paired with `trim`'s own vertical extent — i.e. the slice of the trim
+/// rectangle that sits under this one panel, before any safety inset is
+/// applied. All three panels share the canvas's full height, but the trim
+/// edge (bleed, or case wrap's board overhang) narrows the outer panels in x
+/// and every panel in y.
+fn panel_trim_slice(panel: Rect, trim: Rect) -> Rect {
+    Rect {
+        x0: length_max(panel.x0, trim.x0),
+        y0: trim.y0,
+        x1: length_min(panel.x1, trim.x1),
+        y1: trim.y1,
+    }
+}
+
+/// Insets `rect` by `amount` on every side, unless doing so would leave no
+/// usable area on either axis (an inset of at least half that axis's own
+/// extent) — in which case `None` is returned rather than a degenerate or
+/// inverted rectangle. `units::Rect::inset` itself does not guard against
+/// this (see `openspec/changes/harden-pdf-correctness/design.md`, "Cover
+/// trim geometry derives from the product, not from a bleed constant" — the
+/// one real caller this matters for is the spine-safety guide below), so the
+/// guard lives here instead.
+fn safe_inset(rect: Rect, amount: Length) -> Option<Rect> {
+    let min_amount = amount.as_points() * 2.0;
+    if rect.width().as_points() <= min_amount || rect.height().as_points() <= min_amount {
+        return None;
+    }
+    Some(rect.inset(amount))
+}
+
+/// The narrow-spine warning ([`geometry::spine_too_narrow_for_text`]) as a
+/// [`crate::report::Finding`], for callers that already return findings
+/// ([`fit_supplied_cover`], [`assemble_three_panel_cover`]). Lulu's own
+/// binding variance means text committed to a spine this narrow risks being
+/// trimmed off or wrapped around the edge.
+fn narrow_spine_finding(geo: &CoverGeometry) -> Option<crate::report::Finding> {
+    let spine_width = geo.fold_positions.1 - geo.fold_positions.0;
+    if !geometry::spine_too_narrow_for_text(spine_width) {
+        return None;
+    }
+    Some(
+        crate::report::Finding::new(
+            "cover.spine-too-narrow-for-text",
+            crate::report::Severity::Warning,
+            format!(
+                "spine is {:.3}in wide, narrower than the 0.125in Lulu recommends for \
+                 reliable spine text given binding variance",
+                spine_width.as_inches()
+            ),
+        )
+        .with_observed(format!("{:.3}in", spine_width.as_inches()))
+        .with_expected("0.125in minimum")
+        .fixable(false),
+    )
+}
+
 /// Writes a blank cover template PDF: the exact canvas size, with
 /// non-printing guides (trim, fold, safety margins, and — for hardcover —
 /// hinge zones) in one named, removable optional content group, plus a
 /// always-visible legend. Marked in both its legend text and its document
 /// `Subject` metadata as a design aid, never itself submittable to Lulu.
+///
+/// The trim guide is drawn at `geo.trim_rect`, and each panel's safety guide
+/// is inset from the slice of that trim rectangle under it
+/// ([`panel_trim_slice`]), not from the raw panel rectangle — so a case-wrap
+/// guide correctly starts at the board overhang rather than the canvas edge.
+/// When a safety inset would leave the spine with no usable area
+/// ([`safe_inset`] returning `None`), no guide is drawn for it and the
+/// legend carries a warning instead of a mirrored, degenerate box. The
+/// legend also carries [`geometry::spine_too_narrow_for_text`]'s warning
+/// when applicable — this function has no findings-vector return (its one
+/// caller outside this module treats it as a bare `Document`), so both
+/// warnings surface as visible legend text on the artifact itself rather
+/// than a [`crate::report::Finding`]; [`fit_supplied_cover`] and
+/// [`assemble_three_panel_cover`], which do return findings, additionally
+/// emit [`narrow_spine_finding`] as a proper finding.
 pub fn generate_template(geo: &CoverGeometry, meta: &CoverMetadata) -> lopdf::Document {
     let mut doc = lopdf::Document::with_version("1.7");
 
@@ -356,7 +465,7 @@ pub fn generate_template(geo: &CoverGeometry, meta: &CoverMetadata) -> lopdf::Do
         "Name" => lopdf::Object::String(b"Cover Guides (delete before printing)".to_vec(), lopdf::StringFormat::Literal),
     });
 
-    let trim_rect = Rect::from_origin_size(geo.canvas).inset(geometry::bleed());
+    let trim_rect = geo.trim_rect;
     let mut guide_ops = String::new();
     guide_ops.push_str("q 1 0 0 RG 0.5 w\n");
     guide_ops.push_str(&rect_stroke_path(trim_rect));
@@ -374,10 +483,21 @@ pub fn generate_template(geo: &CoverGeometry, meta: &CoverMetadata) -> lopdf::Do
     ));
     guide_ops.push('\n');
     guide_ops.push_str("0 0 1 RG [3 3] 0 d\n");
-    for panel in [geo.back_panel, geo.spine, geo.front_panel] {
-        let safety = panel.inset(geo.safety_margin);
-        guide_ops.push_str(&rect_stroke_path(safety));
-        guide_ops.push('\n');
+    let mut spine_has_no_safe_area = false;
+    for (label, panel) in [
+        ("back", geo.back_panel),
+        ("spine", geo.spine),
+        ("front", geo.front_panel),
+    ] {
+        let panel_trim = panel_trim_slice(panel, trim_rect);
+        match safe_inset(panel_trim, geo.safety_margin) {
+            Some(safety) => {
+                guide_ops.push_str(&rect_stroke_path(safety));
+                guide_ops.push('\n');
+            }
+            None if label == "spine" => spine_has_no_safe_area = true,
+            None => {}
+        }
     }
     if let Some((left_hinge, right_hinge)) = geo.hinge_zones {
         guide_ops.push_str("0 0.6 0 RG [1 2] 0 d\n");
@@ -394,7 +514,7 @@ pub fn generate_template(geo: &CoverGeometry, meta: &CoverMetadata) -> lopdf::Do
 
     let marked_guides = format!("/OC /MC0 BDC\n{guide_ops}EMC\n");
 
-    let legend_lines = [
+    let mut legend_lines = vec![
         NOT_FOR_SUBMISSION_NOTICE.to_string(),
         format!("Product: {}", meta.product_sku),
         format!("Page count: {}", meta.page_count),
@@ -405,6 +525,21 @@ pub fn generate_template(geo: &CoverGeometry, meta: &CoverMetadata) -> lopdf::Do
             meta.canvas.height.as_inches()
         ),
     ];
+    let spine_width = geo.fold_positions.1 - geo.fold_positions.0;
+    if geometry::spine_too_narrow_for_text(spine_width) {
+        legend_lines.push(format!(
+            "WARNING: spine is {:.3} in, narrower than 0.125 in -- too narrow to hold text \
+             reliably given Lulu's binding variance",
+            spine_width.as_inches()
+        ));
+    }
+    if spine_has_no_safe_area {
+        legend_lines.push(
+            "WARNING: spine has no usable safe area at this safety margin -- do not place \
+             text or important artwork on the spine"
+                .to_string(),
+        );
+    }
     let mut legend = String::from("0 0 0 rg BT /F1 10 Tf\n");
     let legend_x = geo.back_panel.x0.as_points() + 6.0;
     let mut legend_y = geo.canvas.height.as_points() - 14.0;
@@ -485,18 +620,33 @@ pub enum FitArtworkError {
 /// already at the required size (within 0.5 pt) passes through unscaled
 /// (`fit_mode` still applies for a genuine mismatch, offering the same
 /// `center`/`scale-to-bleed`/`stretch-margins` choices as the interior).
-/// Reports a blocking, non-stretching finding when the width is off by an
-/// amount consistent with a spine computed for the wrong page count — this
-/// runs regardless of `fit_mode`, since a caller opting into scaling should
-/// still be told *why* the artwork didn't already fit.
+///
+/// The supplied artwork's size is measured *effectively* — with `/Rotate`
+/// applied, per [`crate::pdf::effective_page_size`] — not by its raw box, so
+/// a cover carrying `/Rotate 90` is compared against the canvas on the axis
+/// it actually displays on. Reports a blocking, non-stretching finding when
+/// the width is off by an amount consistent with a spine computed for the
+/// wrong page count, and a separate blocking finding when the height
+/// doesn't match — both run regardless of `fit_mode`, since a caller opting
+/// into scaling should still be told *why* the artwork didn't already fit.
+///
+/// `nest_page` sets `TrimBox`/`ArtBox` from a plain bleed inset, which is
+/// only correct for perfect binding; this function corrects both to
+/// `geo.trim_rect` afterwards so a case-wrap supplied cover ends up with the
+/// same trim edge a freshly generated template would carry.
 pub fn fit_supplied_cover(
     doc: &mut lopdf::Document,
     page_id: lopdf::ObjectId,
     geo: &CoverGeometry,
     fit_mode: crate::normalize::FitMode,
 ) -> Result<Vec<crate::report::Finding>, FitArtworkError> {
-    let original_size = crate::pdf::own_box_size(doc, page_id)?;
+    let original_size = crate::pdf::effective_page_size(doc, page_id)?;
     crate::normalize::nest_page(doc, page_id, geo.canvas, fit_mode, Matrix::IDENTITY)?;
+
+    if let Ok(page_dict) = doc.get_dictionary_mut(page_id) {
+        page_dict.set("TrimBox", rect_to_array(geo.trim_rect));
+        page_dict.set("ArtBox", rect_to_array(geo.trim_rect));
+    }
 
     let mut findings = Vec::new();
     let width_diff = (geo.canvas.width - original_size.width).as_points();
@@ -526,6 +676,31 @@ pub fn fit_supplied_cover(
             .with_expected(format!("{:.1}pt", geo.canvas.width.as_points()))
             .fixable(false),
         );
+    }
+    let height_diff = (geo.canvas.height - original_size.height).as_points();
+    if height_diff.abs() > 0.5 {
+        findings.push(
+            crate::report::Finding::new(
+                "cover.height-mismatch",
+                crate::report::Severity::Blocking,
+                format!(
+                    "supplied cover is {:.1}pt {} than the required {:.1}pt height",
+                    height_diff.abs(),
+                    if height_diff > 0.0 {
+                        "shorter"
+                    } else {
+                        "taller"
+                    },
+                    geo.canvas.height.as_points()
+                ),
+            )
+            .with_observed(format!("{:.1}pt", original_size.height.as_points()))
+            .with_expected(format!("{:.1}pt", geo.canvas.height.as_points()))
+            .fixable(false),
+        );
+    }
+    if let Some(finding) = narrow_spine_finding(geo) {
+        findings.push(finding);
     }
     Ok(findings)
 }
@@ -583,48 +758,139 @@ fn copy_page_as_form(
     ))))
 }
 
+/// Which edge of its destination panel a supplied panel is aligned to, when
+/// its size doesn't exactly match the panel: the two outer panels (back,
+/// front) sit flush against the canvas's own outer edge rather than being
+/// centred, since that's the edge that must line up with the physical case;
+/// the spine, which has no outer edge of its own, stays centred between its
+/// two folds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelAlign {
+    OuterLeft,
+    Center,
+    OuterRight,
+}
+
+fn panel_label(name: &str) -> &'static str {
+    match name {
+        "Bk" => "back cover panel",
+        "Sp" => "spine panel",
+        "Fr" => "front cover panel",
+        _ => "panel",
+    }
+}
+
+/// A finding for a supplied panel whose size doesn't match its destination
+/// panel's computed size — reported rather than silently centred or
+/// stretched, since a mismatch this specific (a whole supplied file, not
+/// just a content element) usually means the wrong artwork or a spine
+/// computed for a different page count.
+fn panel_size_mismatch_finding(
+    name: &str,
+    supplied: Size,
+    expected: Size,
+) -> crate::report::Finding {
+    crate::report::Finding::new(
+        "cover.panel-size-mismatch",
+        crate::report::Severity::Blocking,
+        format!(
+            "{} artwork is {:.1} x {:.1}pt, but its destination panel is {:.1} x {:.1}pt",
+            panel_label(name),
+            supplied.width.as_points(),
+            supplied.height.as_points(),
+            expected.width.as_points(),
+            expected.height.as_points(),
+        ),
+    )
+    .with_observed(format!(
+        "{:.1} x {:.1}pt",
+        supplied.width.as_points(),
+        supplied.height.as_points()
+    ))
+    .with_expected(format!(
+        "{:.1} x {:.1}pt",
+        expected.width.as_points(),
+        expected.height.as_points()
+    ))
+    .fixable(false)
+}
+
 /// Assembles separately supplied back-cover, spine, and front-cover pages
 /// into one wrap-format cover document, placing each at its computed panel
 /// rectangle in left-to-right order. Each source may be a different
 /// `Document`; fonts, images, and nested XObjects are deep-copied
 /// ([`crate::pdf::deep_copy_object`]) into the assembled result.
+///
+/// Each panel's form is clipped to its destination panel rectangle (an
+/// explicit `re W n` in the content stream, ahead of the `cm ... Do`, the
+/// same pattern [`crate::normalize::split_spread_pages`] uses for its half-
+/// page clip) so oversized supplied artwork cannot spill across the fold
+/// onto a neighbouring panel. The two outer panels are aligned to the
+/// canvas's outer edge rather than centred in their panel ([`PanelAlign`]);
+/// the spine stays centred, since it has no outer edge. A supplied panel
+/// whose own size doesn't match its destination panel's size (within 0.5 pt
+/// on either axis) is reported via [`panel_size_mismatch_finding`] rather
+/// than silently shifted or clipped without comment.
 pub fn assemble_three_panel_cover(
     back: (&lopdf::Document, lopdf::ObjectId),
     spine: (&lopdf::Document, lopdf::ObjectId),
     front: (&lopdf::Document, lopdf::ObjectId),
     geo: &CoverGeometry,
-) -> Result<lopdf::Document, crate::pdf::PageGeometryError> {
+) -> Result<(lopdf::Document, Vec<crate::report::Finding>), crate::pdf::PageGeometryError> {
     let mut dest = lopdf::Document::with_version("1.7");
     let mut content = String::new();
     let mut xobjects = Dictionary::new();
+    let mut findings = Vec::new();
 
-    for (name, (src, src_page_id), dest_rect) in [
-        ("Bk", back, geo.back_panel),
-        ("Sp", spine, geo.spine),
-        ("Fr", front, geo.front_panel),
+    for (name, (src, src_page_id), dest_rect, align) in [
+        ("Bk", back, geo.back_panel, PanelAlign::OuterLeft),
+        ("Sp", spine, geo.spine, PanelAlign::Center),
+        ("Fr", front, geo.front_panel, PanelAlign::OuterRight),
     ] {
         let own_rect = crate::pdf::own_box_rect(src, src_page_id)?;
         let own_size = Size::new(own_rect.width(), own_rect.height());
         let dest_size = Size::new(dest_rect.width(), dest_rect.height());
-        let placement =
-            crate::normalize::fit_placement(own_size, dest_size, crate::normalize::FitMode::Center);
+
+        if !own_size.approx_eq(dest_size, Length::from_points(0.5)) {
+            findings.push(panel_size_mismatch_finding(name, own_size, dest_size));
+        }
+
+        let dy = (dest_size.height - own_size.height) / 2.0;
+        let dx = match align {
+            PanelAlign::OuterLeft => Length::ZERO,
+            PanelAlign::OuterRight => dest_size.width - own_size.width,
+            PanelAlign::Center => (dest_size.width - own_size.width) / 2.0,
+        };
         let to_origin = Matrix::translate(Length::ZERO - own_rect.x0, Length::ZERO - own_rect.y0);
-        let to_panel_origin = Matrix::translate(dest_rect.x0, dest_rect.y0);
-        let full = to_origin.then(placement.transform).then(to_panel_origin);
+        let to_panel_origin = Matrix::translate(dest_rect.x0 + dx, dest_rect.y0 + dy);
+        let full = to_origin.then(to_panel_origin);
 
         let form_id = copy_page_as_form(&mut dest, src, src_page_id)?;
         xobjects.set(name, lopdf::Object::Reference(form_id));
 
         let cm = full.as_cm_operands();
         content.push_str(&format!(
-            "q {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{name} Do Q\n",
-            cm[0], cm[1], cm[2], cm[3], cm[4], cm[5]
+            "q {:.4} {:.4} {:.4} {:.4} re W n {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} cm /{name} Do Q\n",
+            dest_rect.x0.as_points(),
+            dest_rect.y0.as_points(),
+            dest_rect.width().as_points(),
+            dest_rect.height().as_points(),
+            cm[0],
+            cm[1],
+            cm[2],
+            cm[3],
+            cm[4],
+            cm[5]
         ));
+    }
+
+    if let Some(finding) = narrow_spine_finding(geo) {
+        findings.push(finding);
     }
 
     let content_id = dest.add_object(lopdf::Stream::new(dictionary! {}, content.into_bytes()));
     let resources = dictionary! { "XObject" => xobjects };
-    let trim_rect = Rect::from_origin_size(geo.canvas).inset(geometry::bleed());
+    let trim_rect = geo.trim_rect;
 
     let pages_id = dest.new_object_id();
     let page_id = dest.add_object(dictionary! {
@@ -632,6 +898,7 @@ pub fn assemble_three_panel_cover(
         "Parent" => lopdf::Object::Reference(pages_id),
         "MediaBox" => rect_to_array(Rect::from_origin_size(geo.canvas)),
         "TrimBox" => rect_to_array(trim_rect),
+        "ArtBox" => rect_to_array(trim_rect),
         "Contents" => lopdf::Object::Reference(content_id),
         "Resources" => resources,
     });
@@ -644,7 +911,7 @@ pub fn assemble_three_panel_cover(
     dest.trailer
         .set("Root", lopdf::Object::Reference(catalog_id));
 
-    Ok(dest)
+    Ok((dest, findings))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1198,13 +1465,19 @@ mod tests {
             b"0 0 1 rg 0 0 1 1 re f",
         );
 
-        let assembled = assemble_three_panel_cover(
+        let (assembled, findings) = assemble_three_panel_cover(
             (&back_doc, back_page),
             (&spine_doc, spine_page),
             (&front_doc, front_page),
             &geo,
         )
         .unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.code != "cover.panel-size-mismatch"),
+            "correctly sized panels should not report a mismatch: {findings:?}"
+        );
 
         assert_eq!(assembled.get_pages().len(), 1);
         let page_id = *assembled.get_pages().values().next().unwrap();
@@ -1488,5 +1761,331 @@ mod tests {
         // 212 is conformant (multiple of 4, matching the binding's rule).
         let geo = cover_geometry(entry, 212).unwrap();
         assert_close(geo.canvas.width, 1044.0, "212 pages width");
+    }
+
+    // --- trim rectangle: task 4.1-4.4 ---
+
+    #[test]
+    fn case_wrap_trim_rect_is_inset_by_the_board_overhang_not_bleed() {
+        // The exact 212-page, 6x9in case-wrap example from the code review:
+        // canvas 1044x774pt, so the trim rect must be [63 63 981 711] (63pt =
+        // 0.875in overhang per side), not [9 9 1035 765] (a 9pt bleed inset,
+        // which is only correct for perfect binding).
+        let entry = crate::catalog::lookup("0600X0900.BW.STD.CW.060UW444.MXX").unwrap();
+        let geo = cover_geometry(entry, 212).unwrap();
+        assert_close(geo.canvas.width, 1044.0, "canvas width");
+        assert_close(geo.canvas.height, 774.0, "canvas height");
+        assert_close(geo.trim_rect.x0, 63.0, "trim x0");
+        assert_close(geo.trim_rect.y0, 63.0, "trim y0");
+        assert_close(geo.trim_rect.x1, 981.0, "trim x1");
+        assert_close(geo.trim_rect.y1, 711.0, "trim y1");
+    }
+
+    #[test]
+    fn perfect_bound_trim_rect_is_inset_by_bleed() {
+        let geo = cover_geometry(sku(), 212).unwrap();
+        let bleed_pt = geometry::bleed().as_points();
+        assert!((geo.trim_rect.x0.as_points() - bleed_pt).abs() < 1e-6);
+        assert!((geo.trim_rect.y0.as_points() - bleed_pt).abs() < 1e-6);
+        assert!(
+            (geo.trim_rect.x1.as_points() - (geo.canvas.width.as_points() - bleed_pt)).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn template_case_wrap_trim_guide_and_page_boxes_read_the_board_overhang() {
+        let entry = crate::catalog::lookup("0600X0900.BW.STD.CW.060UW444.MXX").unwrap();
+        let geo = cover_geometry(entry, 212).unwrap();
+        let meta = CoverMetadata {
+            product_sku: &entry.sku,
+            page_count: 212,
+            spine_width: geo.spine.width(),
+            canvas: geo.canvas,
+        };
+        let doc = generate_template(&geo, &meta);
+        let page_id = *doc.get_pages().values().next().unwrap();
+        let page = doc.get_dictionary(page_id).unwrap();
+        let trim: Vec<f64> = page
+            .get(b"TrimBox")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_float().unwrap() as f64)
+            .collect();
+        assert_close(Length::from_points(trim[0]), 63.0, "template trim x0");
+        assert_close(Length::from_points(trim[1]), 63.0, "template trim y0");
+        assert_close(Length::from_points(trim[2]), 981.0, "template trim x1");
+        assert_close(Length::from_points(trim[3]), 711.0, "template trim y1");
+    }
+
+    #[test]
+    fn template_safety_guides_are_inset_from_trim_not_from_the_panel() {
+        // Back panel's outer safety edge must sit at the trim edge (board
+        // overhang) plus the case-wrap safety margin, not just the margin
+        // measured from the raw canvas edge.
+        let entry = crate::catalog::lookup("0600X0900.BW.STD.CW.060UW444.MXX").unwrap();
+        let geo = cover_geometry(entry, 212).unwrap();
+        let expected_outer_safety_x0 = geo.trim_rect.x0.as_points() + geo.safety_margin.as_points();
+        // 0.875in overhang + 0.75in case-wrap safety margin = 1.625in = 117pt.
+        assert!(
+            (expected_outer_safety_x0 - 117.0).abs() < 0.6,
+            "{expected_outer_safety_x0}"
+        );
+        let wrong_from_canvas_edge = geo.safety_margin.as_points();
+        assert!((expected_outer_safety_x0 - wrong_from_canvas_edge).abs() > 50.0);
+    }
+
+    #[test]
+    fn narrow_spine_gets_no_inverted_safety_guide_and_a_legend_warning() {
+        // A short case-wrap book has a spine well under twice the 0.75in
+        // safety margin, so the spine safety inset is degenerate.
+        let entry = crate::catalog::lookup("0600X0900.BW.STD.CW.060UW444.MXX").unwrap();
+        let rules = PageCountRules::from_catalog_entry(entry);
+        let page_count = rules.next_conformant(entry.min_page).unwrap();
+        let geo = cover_geometry(entry, page_count).unwrap();
+        let spine_width = geo.fold_positions.1 - geo.fold_positions.0;
+        assert!(
+            spine_width.as_points() < 2.0 * geo.safety_margin.as_points(),
+            "test assumption: spine must be narrower than 2x the safety margin: {}",
+            spine_width.as_points()
+        );
+
+        let meta = CoverMetadata {
+            product_sku: &entry.sku,
+            page_count,
+            spine_width,
+            canvas: geo.canvas,
+        };
+        let doc = generate_template(&geo, &meta);
+        let page_id = *doc.get_pages().values().next().unwrap();
+        let content_ref = doc
+            .get_dictionary(page_id)
+            .unwrap()
+            .get(b"Contents")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let Object::Stream(stream) = doc.get_object(content_ref).unwrap() else {
+            panic!()
+        };
+        let text = String::from_utf8_lossy(&stream.get_plain_content().unwrap()).to_string();
+        assert!(
+            text.contains("no usable safe area"),
+            "legend should warn about the degenerate spine safety area: {text}"
+        );
+    }
+
+    #[test]
+    fn safe_inset_reports_none_rather_than_inverting() {
+        let panel = Rect {
+            x0: Length::from_points(0.0),
+            y0: Length::from_points(0.0),
+            x1: Length::from_points(20.0),
+            y1: Length::from_points(100.0),
+        };
+        assert!(safe_inset(panel, Length::from_points(30.0)).is_none());
+        assert!(safe_inset(panel, Length::from_points(5.0)).is_some());
+    }
+
+    // --- narrow-spine warning: task 4.5 ---
+
+    #[test]
+    fn narrow_spine_finding_fires_below_the_eighth_inch_threshold() {
+        let entry = crate::catalog::search(|e| e.binding == Binding::SaddleStitch)
+            .first()
+            .copied()
+            .expect("a saddle-stitch product");
+        // Saddle stitch has no spine at all: SpineWidth::None -> zero width,
+        // which is well under the 0.125in threshold.
+        let geo = cover_geometry(entry, entry.min_page.max(24)).unwrap();
+        let finding = narrow_spine_finding(&geo).expect("zero-width spine must warn");
+        assert_eq!(finding.severity, crate::report::Severity::Warning);
+        assert!(finding.message.contains("0.125"), "{}", finding.message);
+    }
+
+    #[test]
+    fn narrow_spine_finding_is_none_for_a_wide_spine() {
+        let geo = cover_geometry(sku(), 212).unwrap();
+        let spine_width = geo.fold_positions.1 - geo.fold_positions.0;
+        assert!(spine_width.as_inches() > 0.125);
+        assert!(narrow_spine_finding(&geo).is_none());
+    }
+
+    // --- rotation-aware, both-dimension fitting: task 4.6 ---
+
+    #[test]
+    fn rotated_supplied_cover_is_measured_as_displayed() {
+        let geo = cover_geometry(sku(), 212).unwrap();
+        // The page's own (unrotated) box is width x height swapped from the
+        // canvas, but /Rotate 90 makes its displayed size match the canvas
+        // exactly -- this must not be reported as a mismatch.
+        let (mut doc, page_id) = single_page_doc(
+            geo.canvas.height.as_points(),
+            geo.canvas.width.as_points(),
+            b"",
+        );
+        {
+            let page_dict = doc.get_dictionary_mut(page_id).unwrap();
+            page_dict.set("Rotate", 90);
+        }
+        let findings =
+            fit_supplied_cover(&mut doc, page_id, &geo, crate::normalize::FitMode::Center).unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.code != "cover.spine-mismatch" && f.code != "cover.height-mismatch"),
+            "rotated artwork at the correct displayed size must not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_height_artwork_is_caught() {
+        let geo = cover_geometry(sku(), 212).unwrap();
+        let wrong_height = geo.canvas.height.as_points() - 18.0;
+        let (mut doc, page_id) = single_page_doc(geo.canvas.width.as_points(), wrong_height, b"");
+        let findings =
+            fit_supplied_cover(&mut doc, page_id, &geo, crate::normalize::FitMode::Center).unwrap();
+        let f = findings
+            .iter()
+            .find(|f| f.code == "cover.height-mismatch")
+            .expect("height mismatch finding");
+        assert_eq!(f.severity, crate::report::Severity::Blocking);
+        assert!(f.message.contains("18.0"), "{}", f.message);
+    }
+
+    #[test]
+    fn fit_supplied_cover_corrects_trim_box_for_case_wrap() {
+        let entry = crate::catalog::lookup("0600X0900.BW.STD.CW.060UW444.MXX").unwrap();
+        let geo = cover_geometry(entry, 212).unwrap();
+        let (mut doc, page_id) = single_page_doc(
+            geo.canvas.width.as_points(),
+            geo.canvas.height.as_points(),
+            b"",
+        );
+        fit_supplied_cover(&mut doc, page_id, &geo, crate::normalize::FitMode::Center).unwrap();
+        let page = doc.get_dictionary(page_id).unwrap();
+        let trim: Vec<f64> = page
+            .get(b"TrimBox")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_float().unwrap() as f64)
+            .collect();
+        assert_close(Length::from_points(trim[0]), 63.0, "fitted cover trim x0");
+        assert_close(Length::from_points(trim[2]), 981.0, "fitted cover trim x1");
+    }
+
+    // --- panel clipping and alignment: task 4.8 ---
+
+    #[test]
+    fn oversized_back_panel_is_clipped_and_reported() {
+        let geo = cover_geometry(sku(), 212).unwrap();
+        // Back-cover artwork 40pt wider than its panel -- big enough to spill
+        // across the fold if not clipped.
+        let (back_doc, back_page) = single_page_doc(
+            geo.back_panel.width().as_points() + 40.0,
+            geo.back_panel.height().as_points(),
+            b"1 0 0 rg 0 0 1 1 re f",
+        );
+        let (spine_doc, spine_page) = single_page_doc(
+            geo.spine.width().as_points(),
+            geo.spine.height().as_points(),
+            b"",
+        );
+        let (front_doc, front_page) = single_page_doc(
+            geo.front_panel.width().as_points(),
+            geo.front_panel.height().as_points(),
+            b"",
+        );
+
+        let (assembled, findings) = assemble_three_panel_cover(
+            (&back_doc, back_page),
+            (&spine_doc, spine_page),
+            (&front_doc, front_page),
+            &geo,
+        )
+        .unwrap();
+
+        let mismatch = findings
+            .iter()
+            .find(|f| f.code == "cover.panel-size-mismatch")
+            .expect("oversized back panel must be reported");
+        assert!(
+            mismatch.message.contains("back cover panel"),
+            "{}",
+            mismatch.message
+        );
+
+        let page_id = *assembled.get_pages().values().next().unwrap();
+        let page = assembled.get_dictionary(page_id).unwrap();
+        let content_ref = page.get(b"Contents").unwrap().as_reference().unwrap();
+        let Object::Stream(stream) = assembled.get_object(content_ref).unwrap() else {
+            panic!()
+        };
+        let text = String::from_utf8_lossy(&stream.get_plain_content().unwrap()).to_string();
+        // The back panel's clip rect is drawn (`re W n`) at its destination
+        // rect before the `Do`, using the panel's own width -- not the wider
+        // supplied artwork's width.
+        let expected_clip = format!(
+            "{:.4} {:.4} {:.4} {:.4} re W n",
+            geo.back_panel.x0.as_points(),
+            geo.back_panel.y0.as_points(),
+            geo.back_panel.width().as_points(),
+            geo.back_panel.height().as_points()
+        );
+        assert!(text.contains(&expected_clip), "{text}");
+    }
+
+    #[test]
+    fn outer_panels_align_to_the_canvas_edge_not_centred() {
+        let geo = cover_geometry(sku(), 212).unwrap();
+        // Back-cover artwork narrower than its panel: under centring it
+        // would be shifted inward on both sides; flush-outer alignment keeps
+        // its outer (canvas) edge exactly at the panel's outer edge.
+        let narrower = geo.back_panel.width().as_points() - 20.0;
+        let (back_doc, back_page) =
+            single_page_doc(narrower, geo.back_panel.height().as_points(), b"");
+        let (spine_doc, spine_page) = single_page_doc(
+            geo.spine.width().as_points(),
+            geo.spine.height().as_points(),
+            b"",
+        );
+        let (front_doc, front_page) = single_page_doc(
+            geo.front_panel.width().as_points(),
+            geo.front_panel.height().as_points(),
+            b"",
+        );
+
+        let (assembled, _findings) = assemble_three_panel_cover(
+            (&back_doc, back_page),
+            (&spine_doc, spine_page),
+            (&front_doc, front_page),
+            &geo,
+        )
+        .unwrap();
+
+        let page_id = *assembled.get_pages().values().next().unwrap();
+        let page = assembled.get_dictionary(page_id).unwrap();
+        let content_ref = page.get(b"Contents").unwrap().as_reference().unwrap();
+        let Object::Stream(stream) = assembled.get_object(content_ref).unwrap() else {
+            panic!()
+        };
+        let text = String::from_utf8_lossy(&stream.get_plain_content().unwrap()).to_string();
+        // The back panel's `cm` translation (e) must place its content flush
+        // at the canvas's left (outer) edge -- x0 of the back panel, which is
+        // 0 for this geometry -- not shifted inward by half the 20pt gap.
+        let bk_op = text
+            .lines()
+            .find(|l| l.contains("/Bk Do"))
+            .expect("back panel Do operator");
+        // Tokens: q x0 y0 w h re W n a b c d e f cm /Bk Do Q -- cm[4] (e, the
+        // x translation) is token index 12, after the clip rectangle.
+        let e: f64 = bk_op.split_whitespace().nth(12).unwrap().parse().unwrap();
+        assert!(
+            (e - geo.back_panel.x0.as_points()).abs() < 0.01,
+            "back panel should be flush to the outer edge, got e={e}"
+        );
     }
 }

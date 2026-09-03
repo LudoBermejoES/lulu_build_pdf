@@ -40,14 +40,14 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 4. Cover geometry
 
-- [ ] 4.1 Carry the trim rectangle explicitly on `CoverGeometry`, computed by the geometry builder that knows the binding's overhang (0.125 in bleed for perfect binding, 0.875 in board overhang for case wrap)
-- [ ] 4.2 Draw the template's trim guide from that rectangle, and write it as the page's `TrimBox`/`ArtBox`, replacing the hardcoded `canvas.inset(bleed())` at both sites
-- [ ] 4.3 Inset safety guides from the trim rectangle rather than from the panel rectangle
-- [ ] 4.4 Skip or report a degenerate safety inset instead of drawing an inverted rectangle
-- [ ] 4.5 Call `geometry::spine_too_narrow_for_text` from the cover path and emit its warning
-- [ ] 4.6 Measure supplied cover artwork by its effective (rotation-applied) size, and report a height mismatch as well as a width mismatch
+- [x] 4.1 Carry the trim rectangle explicitly on `CoverGeometry`, computed by the geometry builder that knows the binding's overhang (0.125 in bleed for perfect binding, 0.875 in board overhang for case wrap)
+- [x] 4.2 Draw the template's trim guide from that rectangle, and write it as the page's `TrimBox`/`ArtBox`, replacing the hardcoded `canvas.inset(bleed())` at both sites
+- [x] 4.3 Inset safety guides from the trim rectangle rather than from the panel rectangle
+- [x] 4.4 Skip or report a degenerate safety inset instead of drawing an inverted rectangle
+- [x] 4.5 Call `geometry::spine_too_narrow_for_text` from the cover path and emit its warning
+- [x] 4.6 Measure supplied cover artwork by its effective (rotation-applied) size, and report a height mismatch as well as a width mismatch
 - [ ] 4.7 Return an error for a supplied cover with no pages instead of `expect`-panicking, and map it to exit 3
-- [ ] 4.8 In `assemble_three_panel_cover`, clip each panel's form to its destination panel rect, align outer panels to the canvas edge rather than centring, and report a panel-size mismatch
+- [x] 4.8 In `assemble_three_panel_cover`, clip each panel's form to its destination panel rect, align outer panels to the canvas edge rather than centring, and report a panel-size mismatch
 
 ## 5. Lulu API path
 
