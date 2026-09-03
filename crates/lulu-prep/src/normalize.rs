@@ -74,6 +74,12 @@ pub enum FitMode {
     /// than leaving it blank (a documented simplification of Lulu's "extend
     /// the outermost edge pixels **or** fill colour" allowance — true edge
     /// extension would require decoding and resampling raster content).
+    ///
+    /// **Not implemented.** Drawing a real bleed fill would mean rewriting
+    /// content streams, which is out of this change's scope; rather than
+    /// silently behave like [`FitMode::Center`] (the bug this variant's
+    /// existence used to hide), selecting it is refused —
+    /// [`nest_page`] returns [`NestError::StretchMarginsUnimplemented`].
     StretchMargins,
 }
 
@@ -84,11 +90,49 @@ pub enum FitMode {
 pub struct Placement {
     pub transform: Matrix,
     pub scale: f64,
+    /// How far the page's content, mapped through [`nest_page`]'s *full*
+    /// transform (rotation, fit, and any `extra_transform` such as the
+    /// gutter shift), extends beyond the output page's trim rectangle —
+    /// `None` when fully contained. Only [`nest_page`] populates this
+    /// (it alone knows `extra_transform`); a bare call to [`fit_placement`]
+    /// always leaves it `None`.
+    pub trim_overflow: Option<Length>,
+}
+
+/// Whether `size` is safe to place: both dimensions finite and strictly
+/// positive. A degenerate source box (zero width, or a non-finite value
+/// from a malformed PDF) must never reach the division in
+/// [`FitMode::ScaleToBleed`]'s scale computation, which turns it into
+/// `inf`/`NaN` (`specs/interior-normalization/spec.md`, "Degenerate
+/// geometry is refused rather than written").
+fn size_is_finite_and_positive(size: Size) -> bool {
+    let w = size.width.as_points();
+    let h = size.height.as_points();
+    w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
 }
 
 /// Computes where rotation-baked content of `content_size` should be drawn
 /// on a page of `required_size`, under `mode`.
+///
+/// This function's public signature must stay infallible — it is called
+/// directly (not only through [`nest_page`]) by cover assembly, which is
+/// out of this change's scope. [`nest_page`] is the pathway that actually
+/// *refuses* degenerate geometry (returning
+/// [`NestError::DegenerateGeometry`] before ever calling this function);
+/// as a backstop for any other caller, a degenerate `content_size` or
+/// `required_size` here yields an identity placement (`scale` 1.0, no
+/// translation) rather than the `inf`/`NaN` the raw arithmetic would
+/// otherwise produce — never a substitute for the real refusal, only a
+/// guarantee that this function itself can never manufacture a non-finite
+/// operand.
 pub fn fit_placement(content_size: Size, required_size: Size, mode: FitMode) -> Placement {
+    if !size_is_finite_and_positive(content_size) || !size_is_finite_and_positive(required_size) {
+        return Placement {
+            transform: Matrix::IDENTITY,
+            scale: 1.0,
+            trim_overflow: None,
+        };
+    }
     match mode {
         FitMode::Center | FitMode::StretchMargins => {
             let dx = (required_size.width - content_size.width) / 2.0;
@@ -96,6 +140,7 @@ pub fn fit_placement(content_size: Size, required_size: Size, mode: FitMode) -> 
             Placement {
                 transform: Matrix::translate(dx, dy),
                 scale: 1.0,
+                trim_overflow: None,
             }
         }
         FitMode::ScaleToBleed => {
@@ -108,8 +153,59 @@ pub fn fit_placement(content_size: Size, required_size: Size, mode: FitMode) -> 
             Placement {
                 transform: Matrix::scale_uniform(scale).then(Matrix::translate(dx, dy)),
                 scale,
+                trim_overflow: None,
             }
         }
+    }
+}
+
+/// How far `own_rect`'s corners, mapped through `full_transform`, extend
+/// beyond `trim_rect` — `None` when fully contained. Used by [`nest_page`]
+/// to detect a gutter shift (or any other `extra_transform`) pushing
+/// already-laid-out content past the trim edge, since the tool does not
+/// control — and cannot see — the source's own margins
+/// (`specs/interior-normalization/spec.md`, "Gutter shift").
+fn trim_overflow_for(own_rect: Rect, full_transform: Matrix, trim_rect: Rect) -> Option<Length> {
+    let corners = [
+        (own_rect.x0, own_rect.y0),
+        (own_rect.x1, own_rect.y0),
+        (own_rect.x1, own_rect.y1),
+        (own_rect.x0, own_rect.y1),
+    ];
+    let mapped: Vec<(f64, f64)> = corners
+        .iter()
+        .map(|&(x, y)| {
+            let (mx, my) = full_transform.apply_to_point(x, y);
+            (mx.as_points(), my.as_points())
+        })
+        .collect();
+    let min_x = mapped.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let max_x = mapped.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let min_y = mapped.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let max_y = mapped.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+
+    let trim = trim_rect.as_pdf_array_points();
+    let over = (trim[0] - min_x)
+        .max(max_x - trim[2])
+        .max(trim[1] - min_y)
+        .max(max_y - trim[3]);
+    (over > 1e-6).then(|| Length::from_points(over))
+}
+
+/// Backstop for [`nest_page`] and [`split_spread_pages`]: every `cm`
+/// operand written into a generated content stream must be finite. This
+/// should never trigger — both callers refuse degenerate geometry well
+/// before reaching this point — but a `NaN` or infinity reaching a content
+/// stream is exactly the class of bug this guards against, so it is
+/// verified immediately before formatting rather than trusted from
+/// upstream (`specs/interior-normalization/spec.md`, "Degenerate geometry
+/// is refused rather than written").
+fn assert_finite_cm(cm: &[f64; 6]) {
+    for (i, v) in cm.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "generated cm operand {i} is not finite ({v}); degenerate geometry escaped an earlier refusal"
+        );
     }
 }
 
@@ -129,12 +225,69 @@ pub fn page_boxes(required_size: Size) -> PageBoxes {
     }
 }
 
+/// Resolves a page's effective `/Resources`: its own dictionary, whether
+/// written directly or as an indirect reference, merged over any
+/// `/Resources` inherited from its `Pages` ancestors — the page's own
+/// top-level category keys (`Font`, `XObject`, `ColorSpace`, ...) win over
+/// an inherited category of the same name, matching PDF's own inheritance
+/// rule. This is the single accessor every form-XObject-building site in
+/// this file goes through, so a page whose `/Resources` is indirect or
+/// inherited — the shape essentially every real PDF producer emits — no
+/// longer loses every font and image it names
+/// (`specs/interior-normalization/spec.md`, "Nesting preserves the source
+/// page's effective resources").
+///
+/// Returns `Err(page_id)` only when a `/Resources` entry — the page's own
+/// or an inherited one — is present but does not resolve to a dictionary
+/// (e.g. a broken indirect reference). That is deliberately distinct from
+/// "no `/Resources` anywhere in the chain", which is a legitimately
+/// resource-free page (the blank pages this tool itself appends are
+/// exactly that) and resolves to an empty dictionary rather than an error.
+fn effective_page_resources(
+    doc: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+) -> Result<lopdf::Dictionary, lopdf::ObjectId> {
+    let mut chain: Vec<&lopdf::Dictionary> = Vec::new();
+    let mut current = doc.get_dictionary(page_id).map_err(|_| page_id)?;
+    // A depth cap guards against a `/Parent` cycle — a malformed but
+    // possible input this walk must never hang on. 64 comfortably exceeds
+    // any plausible Pages-tree depth.
+    for _ in 0..64 {
+        chain.push(current);
+        let Ok(parent_id) = current.get(b"Parent").and_then(|o| o.as_reference()) else {
+            break;
+        };
+        let Ok(parent_dict) = doc.get_dictionary(parent_id) else {
+            break;
+        };
+        current = parent_dict;
+    }
+
+    let mut merged = lopdf::Dictionary::new();
+    for dict in chain.iter().rev() {
+        let Ok(resources_obj) = dict.get(b"Resources") else {
+            continue;
+        };
+        let resources_dict = match resources_obj {
+            lopdf::Object::Dictionary(d) => d,
+            lopdf::Object::Reference(id) => doc.get_dictionary(*id).map_err(|_| page_id)?,
+            _ => return Err(page_id),
+        };
+        for (key, value) in resources_dict.iter() {
+            merged.set(key.clone(), value.clone());
+        }
+    }
+    Ok(merged)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpreadSplitError {
     #[error(transparent)]
     Pdf(#[from] lopdf::Error),
     #[error(transparent)]
     Geometry(#[from] crate::pdf::PageGeometryError),
+    #[error("page {0:?}'s resources could not be resolved (a direct, indirect, or inherited /Resources entry did not resolve to a dictionary)")]
+    UnresolvableResources(lopdf::ObjectId),
 }
 
 /// Splits every page down its vertical centre into two single pages, left
@@ -161,12 +314,8 @@ pub fn split_spread_pages(doc: &mut lopdf::Document) -> Result<u32, SpreadSplitE
         let height = own_rect.height();
 
         let content_bytes = doc.get_page_content(page_id);
-        let resources = doc
-            .get_page_resources(page_id)
-            .ok()
-            .and_then(|(r, _)| r)
-            .cloned()
-            .unwrap_or_default();
+        let resources = effective_page_resources(doc, page_id)
+            .map_err(SpreadSplitError::UnresolvableResources)?;
         let form_dict = dictionary! {
             "Type" => "XObject",
             "Subtype" => "Form",
@@ -189,6 +338,7 @@ pub fn split_spread_pages(doc: &mut lopdf::Document) -> Result<u32, SpreadSplitE
 
         let half_page = |doc: &mut lopdf::Document, width: Length, cm: Matrix| -> lopdf::ObjectId {
             let cm = cm.as_cm_operands();
+            assert_finite_cm(&cm);
             let content = format!(
                 "q 0 0 {} {} re W n {} {} {} {} {} {} cm /Fx0 Do Q",
                 width.as_points(),
@@ -377,7 +527,9 @@ pub fn sanitize_summary_findings(summary: &SanitizeSummary) -> Vec<Finding> {
 /// multimedia annotations along with them, since those are just other
 /// annotation subtypes), the catalog's `AcroForm` and its fields,
 /// document-level JavaScript and embedded files (both live under the
-/// catalog's `/Names` tree), and forces a single-page `/PageLayout`.
+/// catalog's `/Names` tree, resolved whether it is a direct dictionary or
+/// an indirect reference, so both are genuinely removed either way), and
+/// forces a single-page `/PageLayout`.
 /// Encryption is not handled here: an empty-password-encrypted file is
 /// already fully decrypted with its `/Encrypt` trailer entry removed by the
 /// time [`crate::pdf::load_from_bytes`] returns it (see that function's
@@ -399,11 +551,50 @@ pub fn sanitize_structure(doc: &mut lopdf::Document) -> SanitizeSummary {
         }
     }
 
-    if let Ok(catalog) = doc.catalog_mut() {
-        if catalog.remove(b"AcroForm").is_some() {
-            summary.acroform_removed = true;
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|o| o.as_reference().ok());
+
+    // Resolved once, up front: a mutable borrow of the catalog dictionary
+    // can't overlap with a separate mutable borrow of a different object,
+    // so whether `/Names` is an indirect reference (a distinct object to
+    // mutate on its own) must be known before the catalog is borrowed
+    // mutably below.
+    let names_ref: Option<lopdf::ObjectId> = catalog_id
+        .and_then(|id| doc.get_dictionary(id).ok())
+        .and_then(|catalog| catalog.get(b"Names").ok())
+        .and_then(|names_obj| match names_obj {
+            lopdf::Object::Reference(id) => Some(*id),
+            _ => None,
+        });
+
+    if let Some(catalog_id) = catalog_id {
+        if let Ok(catalog) = doc.get_dictionary_mut(catalog_id) {
+            if catalog.remove(b"AcroForm").is_some() {
+                summary.acroform_removed = true;
+            }
+            if names_ref.is_none() {
+                // `/Names`, if present at all, is a direct dictionary here
+                // (the indirect case is handled below, after this borrow
+                // of the catalog ends).
+                if let Ok(names) = catalog.get_mut(b"Names").and_then(|o| o.as_dict_mut()) {
+                    if names.remove(b"JavaScript").is_some() {
+                        summary.javascript_removed = true;
+                    }
+                    if names.remove(b"EmbeddedFiles").is_some() {
+                        summary.embedded_files_removed = true;
+                    }
+                }
+            }
+            catalog.set("PageLayout", lopdf::Object::Name(b"SinglePage".to_vec()));
+            summary.page_layout_forced = true;
         }
-        if let Ok(names) = catalog.get_mut(b"Names").and_then(|o| o.as_dict_mut()) {
+    }
+
+    if let Some(names_id) = names_ref {
+        if let Ok(names) = doc.get_dictionary_mut(names_id) {
             if names.remove(b"JavaScript").is_some() {
                 summary.javascript_removed = true;
             }
@@ -411,8 +602,6 @@ pub fn sanitize_structure(doc: &mut lopdf::Document) -> SanitizeSummary {
                 summary.embedded_files_removed = true;
             }
         }
-        catalog.set("PageLayout", lopdf::Object::Name(b"SinglePage".to_vec()));
-        summary.page_layout_forced = true;
     }
 
     summary
@@ -435,6 +624,12 @@ pub fn gutter_shift(page_number: u32, gutter: Length) -> Matrix {
 pub enum NestError {
     #[error("could not read source page geometry: {0}")]
     Geometry(#[from] crate::pdf::PageGeometryError),
+    #[error("page {0:?}'s resources could not be resolved (a direct, indirect, or inherited /Resources entry did not resolve to a dictionary)")]
+    UnresolvableResources(lopdf::ObjectId),
+    #[error("page {0:?} resolves to a non-finite or non-positive size and cannot be placed")]
+    DegenerateGeometry(lopdf::ObjectId),
+    #[error("FitMode::StretchMargins is not implemented — its documented bleed fill is not drawn, and it must not silently behave as FitMode::Center")]
+    StretchMarginsUnimplemented,
 }
 
 fn rect_to_array(r: Rect) -> lopdf::Object {
@@ -461,12 +656,25 @@ pub fn nest_page(
     fit_mode: FitMode,
     extra_transform: Matrix,
 ) -> Result<Placement, NestError> {
+    if fit_mode == FitMode::StretchMargins {
+        return Err(NestError::StretchMarginsUnimplemented);
+    }
+
     let own_rect = crate::pdf::own_box_rect(doc, page_id)?;
     let rotation = crate::pdf::rotation_degrees(doc, page_id)?;
     let own_size = Size::new(own_rect.width(), own_rect.height());
+    if !size_is_finite_and_positive(own_size) || !size_is_finite_and_positive(required_size) {
+        return Err(NestError::DegenerateGeometry(page_id));
+    }
+
+    // Resolved before any mutation below, so a page whose resources can't
+    // be found is refused with `doc` left completely untouched for that
+    // page, rather than partially rewritten.
+    let resources =
+        effective_page_resources(doc, page_id).map_err(NestError::UnresolvableResources)?;
 
     let (rotate_matrix, rotated_size) = rotation_bake(rotation, own_size);
-    let placement = fit_placement(rotated_size, required_size, fit_mode);
+    let mut placement = fit_placement(rotated_size, required_size, fit_mode);
 
     // The form's BBox is the source page's own (absolute) box, so its content
     // — untouched — is already correctly positioned in form space; this
@@ -478,13 +686,12 @@ pub fn nest_page(
         .then(placement.transform)
         .then(extra_transform);
 
+    let boxes = page_boxes(required_size);
+    if extra_transform != Matrix::IDENTITY {
+        placement.trim_overflow = trim_overflow_for(own_rect, full_transform, boxes.trim_art_box);
+    }
+
     let content_bytes = doc.get_page_content(page_id);
-    let resources = doc
-        .get_page_resources(page_id)
-        .ok()
-        .and_then(|(r, _)| r)
-        .cloned()
-        .unwrap_or_default();
 
     let form_dict = dictionary! {
         "Type" => "XObject",
@@ -498,6 +705,7 @@ pub fn nest_page(
     )));
 
     let cm = full_transform.as_cm_operands();
+    assert_finite_cm(&cm);
     let new_content = format!(
         "q {} {} {} {} {} {} cm /Fx0 Do Q",
         cm[0], cm[1], cm[2], cm[3], cm[4], cm[5]
@@ -505,7 +713,6 @@ pub fn nest_page(
     let new_content_id =
         doc.add_object(lopdf::Stream::new(dictionary! {}, new_content.into_bytes()));
 
-    let boxes = page_boxes(required_size);
     let page_dict = doc
         .get_dictionary_mut(page_id)
         .map_err(crate::pdf::PageGeometryError::from)?;
@@ -553,6 +760,8 @@ pub enum NormalizeInteriorError {
     Pad(#[from] PadError),
     #[error(transparent)]
     SpreadSplit(#[from] SpreadSplitError),
+    #[error("could not de-alias the page tree: {0}")]
+    Dealias(#[from] lopdf::Error),
     #[error("could not write the normalized PDF: {0}")]
     Save(#[from] std::io::Error),
 }
@@ -565,10 +774,110 @@ pub struct NormalizeOutcome {
     pub padded_pages: Vec<u32>,
     pub gutter_applied: Option<Length>,
     pub sanitize_summary: SanitizeSummary,
-    /// The full run report: this function's own findings (what it changed)
-    /// followed by a preflight of its own output, so any finding it could
-    /// not fix is repeated here rather than silently dropped.
+    /// The full run report: this function's own findings (what it changed),
+    /// a preflight of its own output, and any input finding this function
+    /// does not fix (an unembedded font is the canonical case) carried
+    /// forward — so a finding never disappears merely because nesting
+    /// moved the content beyond a check's reach, and the report is never
+    /// more optimistic than `check` would be on the same input.
     pub report: Report,
+}
+
+/// Ensures every page object in the document's (flat) `/Kids` array is
+/// referenced exactly once, by cloning the dictionary of every repeated
+/// occurrence into a fresh, independent object and rewriting that `/Kids`
+/// entry to point at the clone. Without this, a page aliased more than
+/// once in the page tree — a legal but unusual way to repeat a blank page
+/// — would be nested (and gutter-shifted) once per occurrence *in place*,
+/// so transforms compound and only the last occurrence survives correctly
+/// (`specs/interior-normalization/spec.md`, "Pages aliased more than once
+/// in the page tree are handled correctly"). A no-op, and cheap to check,
+/// when nothing is aliased.
+///
+/// Like [`pad_pages`] and [`split_spread_pages`], this assumes the
+/// document's page tree is a single flat `Pages` node — the shape every
+/// fixture and every other page-tree mutation in this file already
+/// assumes.
+fn deduplicate_aliased_pages(doc: &mut lopdf::Document) -> Result<(), lopdf::Error> {
+    let page_ids: Vec<lopdf::ObjectId> = doc.page_iter().collect();
+    let mut seen_ids = std::collections::HashSet::new();
+    if page_ids.iter().all(|id| seen_ids.insert(*id)) {
+        return Ok(());
+    }
+
+    let pages_id = doc.catalog()?.get(b"Pages")?.as_reference()?;
+    let kids: Vec<lopdf::Object> = doc
+        .get_dictionary(pages_id)?
+        .get(b"Kids")?
+        .as_array()?
+        .clone();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut new_kids = Vec::with_capacity(kids.len());
+    for kid in kids {
+        match kid {
+            lopdf::Object::Reference(id) if seen.insert(id) => {
+                new_kids.push(lopdf::Object::Reference(id));
+            }
+            lopdf::Object::Reference(id) => {
+                // Repeated occurrence: clone the page dictionary into a
+                // fresh, independent object so each occurrence is nested
+                // exactly once and gutter/rotation transforms never
+                // compound onto a shared object.
+                let cloned = doc.get_dictionary(id)?.clone();
+                let new_id = doc.add_object(lopdf::Object::Dictionary(cloned));
+                new_kids.push(lopdf::Object::Reference(new_id));
+            }
+            other => new_kids.push(other),
+        }
+    }
+
+    doc.get_dictionary_mut(pages_id)?.set("Kids", new_kids);
+    Ok(())
+}
+
+/// Finding codes [`normalize_interior`] itself structurally fixes as part
+/// of a run — a page-size mismatch is corrected by [`nest_page`], a
+/// page-count shortfall by [`pad_pages`], and the listed structural items
+/// by [`sanitize_structure`]. An input finding carrying one of these codes
+/// is therefore stale by the time the output is preflighted, and carrying
+/// it forward would double-report a defect that is actually gone, not
+/// merely hidden by nesting. Every other preflight code (fonts, image
+/// resolution, colour/ink, and anything else preflight can report) this
+/// function never touches, so it must survive into the final report if
+/// still present on the input (`specs/interior-normalization/spec.md`,
+/// "Run report").
+const FINDINGS_NORMALIZATION_FIXES: &[&str] = &[
+    codes::GEOMETRY_PAGE_SIZE_MISMATCH,
+    codes::GEOMETRY_MIXED_PAGE_SIZES,
+    codes::PAGE_COUNT_BELOW_MINIMUM,
+    codes::PAGE_COUNT_NOT_DIVISIBLE,
+    codes::STRUCTURE_ENCRYPTED,
+    codes::STRUCTURE_ANNOTATIONS,
+    codes::STRUCTURE_SPREAD_LAYOUT,
+];
+
+/// Appends every `input_findings` entry whose code is not one
+/// [`FINDINGS_NORMALIZATION_FIXES`] lists, skipping any already present in
+/// `findings` under the same code and page set. This is the deduplication
+/// the "Run report" requirement asks for: a genuinely fixed finding does
+/// not linger, and a genuinely unfixed one is not doubled when the output
+/// preflight also happens to see it (e.g. once a form-XObject-aware font
+/// check lands).
+fn carry_forward_unfixed_input_findings(findings: &mut Vec<Finding>, input_findings: Vec<Finding>) {
+    let mut seen: std::collections::HashSet<(String, Vec<u32>)> = findings
+        .iter()
+        .map(|f| (f.code.clone(), f.pages.clone()))
+        .collect();
+    for finding in input_findings {
+        if FINDINGS_NORMALIZATION_FIXES.contains(&finding.code.as_str()) {
+            continue;
+        }
+        let key = (finding.code.clone(), finding.pages.clone());
+        if seen.insert(key) {
+            findings.push(finding);
+        }
+    }
 }
 
 /// Turns an arbitrary interior PDF into a Lulu-conformant one for `product`:
@@ -587,6 +896,13 @@ pub fn normalize_interior(
     if doc.is_encrypted() {
         return Err(NormalizeInteriorError::PasswordRequired);
     }
+
+    // Preflight the input as received, before anything below touches it,
+    // so the final report can tell "fixed" apart from "invisible" — see
+    // `carry_forward_unfixed_input_findings` below.
+    let input_report = crate::preflight::preflight(bytes, Some(product));
+
+    deduplicate_aliased_pages(&mut doc)?;
 
     let mut findings = Vec::new();
     if options.split_spreads {
@@ -625,16 +941,65 @@ pub fn normalize_interior(
         let extra = gutter_applied
             .map(|g| gutter_shift(page_number, g))
             .unwrap_or(Matrix::IDENTITY);
-        let placement = nest_page(&mut doc, *page_id, required_size, options.fit_mode, extra)?;
-        if options.fit_mode == FitMode::ScaleToBleed && (placement.scale - 1.0).abs() > 1e-9 {
-            findings.push(Finding::new(
-                "normalize.scaled-to-bleed",
-                Severity::Info,
-                format!(
-                    "page {page_number} scaled by {:.1}% to cover the full bleed area",
-                    (placement.scale - 1.0) * 100.0
-                ),
-            ));
+        match nest_page(&mut doc, *page_id, required_size, options.fit_mode, extra) {
+            Ok(placement) => {
+                if options.fit_mode == FitMode::ScaleToBleed && (placement.scale - 1.0).abs() > 1e-9
+                {
+                    findings.push(Finding::new(
+                        "normalize.scaled-to-bleed",
+                        Severity::Info,
+                        format!(
+                            "page {page_number} scaled by {:.1}% to cover the full bleed area",
+                            (placement.scale - 1.0) * 100.0
+                        ),
+                    ));
+                }
+                if let Some(overflow) = placement.trim_overflow {
+                    findings.push(
+                        Finding::new(
+                            codes::GUTTER_EXCEEDS_SAFE_AREA,
+                            Severity::Warning,
+                            format!(
+                                "the gutter shift pushes page {page_number}'s content {:.3} in beyond the trim rectangle",
+                                overflow.as_inches()
+                            ),
+                        )
+                        .with_pages(vec![page_number]),
+                    );
+                }
+            }
+            // Unresolvable resources and degenerate geometry are refused
+            // per-page rather than aborting the whole run: `doc` is left
+            // untouched for that one page (see `nest_page`'s own
+            // ordering), a blocking finding names it, and the run
+            // continues — matching "normalization reports a blocking
+            // finding ... and the run does not report the output as
+            // print-ready" rather than writing no output at all.
+            Err(NestError::UnresolvableResources(_)) => {
+                findings.push(
+                    Finding::new(
+                        codes::GEOMETRY_UNRESOLVABLE_RESOURCES,
+                        Severity::Blocking,
+                        format!(
+                            "page {page_number}'s resources could not be resolved (a direct, indirect, or inherited /Resources entry did not resolve to a dictionary); its content may name fonts or images this tool could not find, so this page was left unmodified rather than reported as print-ready"
+                        ),
+                    )
+                    .with_pages(vec![page_number]),
+                );
+            }
+            Err(NestError::DegenerateGeometry(_)) => {
+                findings.push(
+                    Finding::new(
+                        codes::GEOMETRY_DEGENERATE,
+                        Severity::Blocking,
+                        format!(
+                            "page {page_number} resolves to a non-finite or zero-area size and could not be placed; it was left unmodified"
+                        ),
+                    )
+                    .with_pages(vec![page_number]),
+                );
+            }
+            Err(other) => return Err(other.into()),
         }
     }
 
@@ -662,6 +1027,7 @@ pub fn normalize_interior(
 
     let mut preflight_report = crate::preflight::preflight(&output_bytes, Some(product));
     findings.append(&mut preflight_report.findings);
+    carry_forward_unfixed_input_findings(&mut findings, input_report.findings);
 
     let report = Report {
         schema_version: SCHEMA_VERSION,
@@ -1138,6 +1504,265 @@ mod tests {
         assert!((placement.scale - 450.0 / 432.0).abs() < 1e-9);
     }
 
+    // --- effective resource resolution (task 3.1) ---
+
+    fn doc_with_page_and_resources(
+        page_resources: Option<Object>,
+        pages_resources: Option<Object>,
+    ) -> (lopdf::Document, lopdf::ObjectId) {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let content_id = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"BT /F1 24 Tf (HELLO) Tj ET".to_vec(),
+        ));
+        let mut page_dict = dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 432.into(), 648.into()]),
+            "Contents" => Object::Reference(content_id),
+        };
+        if let Some(r) = page_resources {
+            page_dict.set("Resources", r);
+        }
+        let page_id = doc.add_object(Object::Dictionary(page_dict));
+        let mut pages_dict = dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 };
+        if let Some(r) = pages_resources {
+            pages_dict.set("Resources", r);
+        }
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, page_id)
+    }
+
+    fn form_font_names(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Vec<Vec<u8>> {
+        let (form_dict, _) = form_dict_and_content(doc, page_id);
+        let resources = form_dict.get(b"Resources").unwrap().as_dict().unwrap();
+        let Ok(font) = resources.get(b"Font").and_then(|o| o.as_dict()) else {
+            return Vec::new();
+        };
+        font.iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    #[test]
+    fn nest_page_resolves_indirect_own_resources() {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let font_id = doc.add_object(
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" },
+        );
+        let resources_id = doc.add_object(
+            dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font_id) } },
+        );
+        let pages_id = doc.new_object_id();
+        let content_id = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"BT /F1 24 Tf (HELLO) Tj ET".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 432.into(), 648.into()]),
+            "Contents" => Object::Reference(content_id),
+            "Resources" => Object::Reference(resources_id),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            Matrix::IDENTITY,
+        )
+        .unwrap();
+
+        assert_eq!(
+            form_font_names(&doc, page_id),
+            vec![b"F1".to_vec()],
+            "an indirect /Resources must survive nesting, not vanish into <<>>"
+        );
+    }
+
+    #[test]
+    fn nest_page_resolves_resources_inherited_from_the_pages_node() {
+        let font_dict = dictionary! { "Font" => dictionary! { "F1" => dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" } } };
+        let (mut doc, page_id) =
+            doc_with_page_and_resources(None, Some(Object::Dictionary(font_dict)));
+
+        nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            Matrix::IDENTITY,
+        )
+        .unwrap();
+
+        assert_eq!(
+            form_font_names(&doc, page_id),
+            vec![b"F1".to_vec()],
+            "resources inherited from the Pages node must survive nesting"
+        );
+    }
+
+    #[test]
+    fn nest_page_own_resources_win_over_inherited() {
+        let page_font = dictionary! { "Font" => dictionary! { "F1" => dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "PageOwnFont" } } };
+        let parent_font = dictionary! { "Font" => dictionary! { "F1" => dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "InheritedFont" } } };
+        let (mut doc, page_id) = doc_with_page_and_resources(
+            Some(Object::Dictionary(page_font)),
+            Some(Object::Dictionary(parent_font)),
+        );
+
+        nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            Matrix::IDENTITY,
+        )
+        .unwrap();
+
+        let (form_dict, _) = form_dict_and_content(&doc, page_id);
+        let resources = form_dict.get(b"Resources").unwrap().as_dict().unwrap();
+        let font = resources.get(b"Font").unwrap().as_dict().unwrap();
+        let f1 = font.get(b"F1").unwrap().as_dict().unwrap();
+        assert_eq!(
+            f1.get(b"BaseFont").unwrap().as_name().unwrap(),
+            b"PageOwnFont",
+            "the page's own /Font entry must win over the inherited one of the same name"
+        );
+    }
+
+    #[test]
+    fn nest_page_refuses_when_resources_are_unresolvable() {
+        let dangling = (999, 0);
+        let (mut doc, page_id) =
+            doc_with_page_and_resources(Some(Object::Reference(dangling)), None);
+
+        let err = nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            Matrix::IDENTITY,
+        )
+        .unwrap_err();
+        assert!(matches!(err, NestError::UnresolvableResources(id) if id == page_id));
+
+        // The page must be left untouched — no empty dictionary substituted.
+        let page = doc.get_dictionary(page_id).unwrap();
+        assert!(
+            page.get(b"Resources").unwrap().as_reference().is_ok(),
+            "a refused page must not be rewritten"
+        );
+    }
+
+    // --- degenerate geometry is refused (task 3.4) ---
+
+    #[test]
+    fn nest_page_refuses_a_zero_width_page_under_scale_to_bleed() {
+        let (mut doc, page_id) = doc_with_one_page([0.0, 0.0, 0.0, 648.0], None, b"");
+        let err = nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::ScaleToBleed,
+            Matrix::IDENTITY,
+        )
+        .unwrap_err();
+        assert!(matches!(err, NestError::DegenerateGeometry(id) if id == page_id));
+    }
+
+    #[test]
+    fn fit_placement_never_produces_non_finite_operands_for_degenerate_content() {
+        let content = Size::new(Length::ZERO, pt(648.0));
+        let required = Size::new(pt(450.0), pt(666.0));
+        let p = fit_placement(content, required, FitMode::ScaleToBleed);
+        assert!(p.scale.is_finite());
+        for v in p.transform.as_cm_operands() {
+            assert!(v.is_finite(), "{v} is not finite");
+        }
+    }
+
+    #[test]
+    fn normalize_interior_reports_degenerate_page_as_blocking_rather_than_writing_nan() {
+        let mut doc = doc_with_n_unbled_pages(2);
+        let first_page_id = *doc.get_pages().get(&1).unwrap();
+        doc.get_dictionary_mut(first_page_id).unwrap().set(
+            "MediaBox",
+            Object::Array(vec![0.into(), 0.into(), 0.into(), 648.into()]),
+        );
+        let input = bytes_for(&mut doc);
+
+        let outcome = normalize_interior(&input, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome.report.is_print_ready(),
+            "{}",
+            outcome.report.to_text()
+        );
+        assert!(outcome
+            .report
+            .findings
+            .iter()
+            .any(|f| f.code == crate::report::codes::GEOMETRY_DEGENERATE));
+
+        // No `cm` operand anywhere in the output may be non-finite.
+        let text = String::from_utf8_lossy(&outcome.output_bytes);
+        assert!(!text.contains("NaN"), "{text}");
+    }
+
+    // --- FitMode::StretchMargins is rejected, not silently aliased (task 3.7) ---
+
+    #[test]
+    fn stretch_margins_is_rejected_rather_than_silently_aliasing_center() {
+        let (mut doc, page_id) = doc_with_one_page([0.0, 0.0, 432.0, 648.0], None, b"");
+        let err = nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::StretchMargins,
+            Matrix::IDENTITY,
+        )
+        .unwrap_err();
+        assert!(matches!(err, NestError::StretchMarginsUnimplemented));
+
+        // An unimplemented mode must not mutate the page as a side effect.
+        let page = doc.get_dictionary(page_id).unwrap();
+        let media: Vec<f64> = page
+            .get(b"MediaBox")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_float().unwrap() as f64)
+            .collect();
+        assert_eq!(media, vec![0.0, 0.0, 432.0, 648.0]);
+    }
+
+    #[test]
+    fn normalize_interior_refuses_stretch_margins_rather_than_aliasing_center() {
+        let mut doc = doc_with_n_unbled_pages(18);
+        let input = bytes_for(&mut doc);
+        let options = NormalizeOptions {
+            fit_mode: FitMode::StretchMargins,
+            ..NormalizeOptions::default()
+        };
+        let err = normalize_interior(&input, sku_entry(), options).unwrap_err();
+        assert!(matches!(
+            err,
+            NormalizeInteriorError::Nest(NestError::StretchMarginsUnimplemented)
+        ));
+    }
+
     // --- gutter shift ---
 
     #[test]
@@ -1202,6 +1827,106 @@ mod tests {
         let (x, y) = m.apply_to_point(Length::ZERO, Length::ZERO);
         assert_pt_eq(x, pt(45.0));
         assert_pt_eq(y, pt(9.0));
+    }
+
+    // --- gutter shift exceeding the trim rectangle is reported (task 3.6) ---
+
+    #[test]
+    fn no_gutter_shift_never_reports_trim_overflow() {
+        let (mut doc, page_id) = doc_with_one_page([0.0, 0.0, 400.0, 600.0], None, b"");
+        let placement = nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            Matrix::IDENTITY,
+        )
+        .unwrap();
+        assert_eq!(placement.trim_overflow, None);
+    }
+
+    #[test]
+    fn a_gutter_shift_within_the_sources_own_margin_reports_no_overflow() {
+        // 400x600 content, Center-fit for 450x666: (450-400)/2 = 25pt margin
+        // each side in x, and trim sits 9pt in from the page edge, so there
+        // is 25 - 9 = 16pt of slack before the content reaches the trim
+        // rectangle. A 5pt gutter stays comfortably inside that.
+        let (mut doc, page_id) = doc_with_one_page([0.0, 0.0, 400.0, 600.0], None, b"");
+        let placement = nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            gutter_shift(1, pt(5.0)),
+        )
+        .unwrap();
+        assert_eq!(placement.trim_overflow, None);
+    }
+
+    #[test]
+    fn a_gutter_shift_beyond_the_sources_own_margin_is_reported() {
+        // Same geometry as above, but a 30pt gutter exceeds the 16pt slack
+        // by exactly 14pt.
+        let (mut doc, page_id) = doc_with_one_page([0.0, 0.0, 400.0, 600.0], None, b"");
+        let placement = nest_page(
+            &mut doc,
+            page_id,
+            Size::new(pt(450.0), pt(666.0)),
+            FitMode::Center,
+            gutter_shift(1, pt(30.0)),
+        )
+        .unwrap();
+        let overflow = placement
+            .trim_overflow
+            .expect("a 30pt gutter on a 16pt margin must exceed the trim rectangle");
+        assert!((overflow.as_points() - 14.0).abs() < 1e-6, "{overflow:?}");
+    }
+
+    #[test]
+    fn normalize_interior_reports_gutter_overflow_as_a_warning_not_a_blocker() {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut kids = Vec::new();
+        // 200 pages of narrow-margin (400x600, no bleed) content — enough
+        // pages to land in the 0.5in (36pt) gutter band, and a page size
+        // with real slack to the trim edge (unlike the 432x648 fixture
+        // used elsewhere, which touches the trim exactly).
+        for _ in 0..200 {
+            let content_id = doc.add_object(lopdf::Stream::new(dictionary! {}, Vec::new()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => Object::Array(vec![0.into(), 0.into(), 400.into(), 600.into()]),
+                "Contents" => Object::Reference(content_id),
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        let pages = dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 200 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let input = bytes_for(&mut doc);
+        let options = NormalizeOptions {
+            apply_gutter: true,
+            ..NormalizeOptions::default()
+        };
+        let outcome = normalize_interior(&input, sku_entry(), options).unwrap();
+
+        let finding = outcome
+            .report
+            .findings
+            .iter()
+            .find(|f| f.code == crate::report::codes::GUTTER_EXCEEDS_SAFE_AREA)
+            .expect("expected a gutter-exceeds-safe-area finding");
+        assert_eq!(finding.severity, crate::report::Severity::Warning);
+        assert!(
+            outcome.report.is_print_ready(),
+            "a warning must not block print-readiness: {}",
+            outcome.report.to_text()
+        );
     }
 
     // --- blank-page padding ---
@@ -1395,6 +2120,45 @@ mod tests {
     }
 
     #[test]
+    fn javascript_behind_an_indirect_names_tree_is_removed() {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let names_id = doc.add_object(dictionary! {
+            "JavaScript" => dictionary! { "Names" => Vec::<Object>::new() },
+            "EmbeddedFiles" => dictionary! { "Names" => Vec::<Object>::new() },
+        });
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 450.into(), 666.into()]),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "Names" => Object::Reference(names_id),
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let summary = sanitize_structure(&mut doc);
+        assert!(summary.javascript_removed, "{summary:?}");
+        assert!(summary.embedded_files_removed, "{summary:?}");
+
+        let names = doc.get_dictionary(names_id).unwrap();
+        assert!(names.get(b"JavaScript").is_err());
+        assert!(names.get(b"EmbeddedFiles").is_err());
+
+        // The catalog's own /Names entry must still be the same indirect
+        // reference — the target object was cleaned in place, not replaced.
+        let catalog = doc.get_dictionary(catalog_id).unwrap();
+        assert_eq!(
+            catalog.get(b"Names").unwrap().as_reference().unwrap(),
+            names_id
+        );
+    }
+
+    #[test]
     fn page_layout_is_always_forced_to_single_page() {
         let mut doc = doc_with_structure(
             dictionary! { "PageLayout" => "TwoPageLeft" },
@@ -1575,6 +2339,178 @@ mod tests {
                 "page {page_number} size changed on re-normalization"
             );
         }
+    }
+
+    // --- input findings this function cannot fix survive into the report
+    // (tasks 3.2/3.3) ---
+
+    #[test]
+    fn check_and_interior_agree_on_the_unembedded_font_fixture() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/unembedded_font.pdf");
+
+        let check_report = crate::preflight::preflight(FIXTURE, Some(sku_entry()));
+        assert!(
+            !check_report.is_print_ready(),
+            "sanity: `check` must already report this file blocking"
+        );
+        assert!(check_report
+            .findings
+            .iter()
+            .any(|f| f.code == crate::report::codes::FONTS_NOT_EMBEDDED));
+
+        let outcome =
+            normalize_interior(FIXTURE, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome.report.is_print_ready(),
+            "`interior` must not report print-ready when `check` reports blocking: {}",
+            outcome.report.to_text()
+        );
+        assert!(
+            outcome
+                .report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::FONTS_NOT_EMBEDDED),
+            "the unembedded-font finding must survive nesting into the final report: {:?}",
+            outcome.report.findings
+        );
+    }
+
+    #[test]
+    fn a_fixed_input_finding_is_not_repeated_in_the_output_report() {
+        // doc_with_n_unbled_pages's pages are the wrong size for sku_entry(),
+        // so the input preflight reports GEOMETRY_PAGE_SIZE_MISMATCH — but
+        // nest_page fixes every page's size unconditionally, so it must not
+        // linger in the final report.
+        let mut doc = doc_with_n_unbled_pages(18);
+        let input = bytes_for(&mut doc);
+        let outcome = normalize_interior(&input, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome
+                .report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::GEOMETRY_PAGE_SIZE_MISMATCH),
+            "a fixed finding must not be carried forward: {:?}",
+            outcome.report.findings
+        );
+    }
+
+    // --- aliased pages are handled correctly (task 3.5) ---
+
+    #[test]
+    fn deduplicate_aliased_pages_splits_a_page_referenced_twice() {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 432.into(), 648.into()]),
+        });
+        let kids = vec![Object::Reference(page_id), Object::Reference(page_id)];
+        let pages = dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        deduplicate_aliased_pages(&mut doc).unwrap();
+
+        let ids: Vec<_> = doc.page_iter().collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "each /Kids occurrence must become a distinct object"
+        );
+        for id in ids {
+            let dict = doc.get_dictionary(id).unwrap();
+            let mb: Vec<f64> = dict
+                .get(b"MediaBox")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_float().unwrap() as f64)
+                .collect();
+            assert_eq!(mb, vec![0.0, 0.0, 432.0, 648.0]);
+        }
+    }
+
+    #[test]
+    fn aliased_page_is_nested_independently_per_occurrence_end_to_end() {
+        let mut doc = doc_with_n_unbled_pages(199);
+        // Alias the first page: push a second reference to the same
+        // object, so the tree has 200 page slots but only 199 distinct
+        // page objects — one aliased twice.
+        let pages_id = doc
+            .catalog()
+            .unwrap()
+            .get(b"Pages")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let first_kid = doc
+            .get_dictionary(pages_id)
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
+        {
+            let pages_dict = doc.get_dictionary_mut(pages_id).unwrap();
+            pages_dict
+                .get_mut(b"Kids")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(first_kid);
+            pages_dict.set("Count", 200);
+        }
+        let input = bytes_for(&mut doc);
+
+        let options = NormalizeOptions {
+            apply_gutter: true,
+            ..NormalizeOptions::default()
+        };
+        let outcome = normalize_interior(&input, sku_entry(), options).unwrap();
+        assert_eq!(outcome.final_page_count, 200, "no padding should be needed");
+
+        let reloaded = crate::pdf::load_from_bytes(&outcome.output_bytes).unwrap();
+        let page1 = *reloaded.get_pages().get(&1).unwrap();
+        let page200 = *reloaded.get_pages().get(&200).unwrap();
+        assert_ne!(
+            page1, page200,
+            "the aliased page's two occurrences must become distinct output pages"
+        );
+
+        let cm_x = |id: lopdf::ObjectId| -> f64 {
+            let page = reloaded.get_dictionary(id).unwrap();
+            let content_ref = page.get(b"Contents").unwrap().as_reference().unwrap();
+            let Object::Stream(stream) = reloaded.get_object(content_ref).unwrap() else {
+                panic!()
+            };
+            let bytes = stream.get_plain_content().unwrap();
+            let content = lopdf::content::Content::decode(&bytes).unwrap();
+            let cm_op = content
+                .operations
+                .iter()
+                .find(|op| op.operator == "cm")
+                .unwrap();
+            cm_op.operands[4].as_float().unwrap() as f64
+        };
+        // Page 1 (odd, recto) shifts toward +x; page 200 (even, verso)
+        // shifts toward -x — both nested from the *same* original page
+        // object, at each occurrence's own position's parity. If the
+        // aliasing bug were still present, the two would compound onto the
+        // same shared object instead of landing independently here.
+        let x1 = cm_x(page1);
+        let x200 = cm_x(page200);
+        assert!(
+            x1 > x200,
+            "page 1 (recto) must land further right than page 200 (verso): {x1} vs {x200}"
+        );
     }
 
     // --- spread splitting ---
