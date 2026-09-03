@@ -27,6 +27,24 @@ pub fn default_output_path(
     output_dir: &Utf8Path,
 ) -> Utf8PathBuf {
     let stem = input.file_stem().unwrap_or("output");
+    default_output_path_from_stem(stem, role, output_dir)
+}
+
+/// Derives `<stem><role-suffix>.pdf` inside `output_dir` directly from
+/// `stem`, without treating it as a file path. Used when the name being
+/// derived from is an identifier (e.g. a `pod_package_id` SKU) rather than
+/// an actual file path, so a dotted trailing segment like `.MXX` is not
+/// mistaken for a file extension and dropped — `file_stem()` on
+/// `"0600X0900.BW.STD.PB.060UW444.MXX"` would otherwise yield
+/// `"0600X0900.BW.STD.PB.060UW444"`, colliding the `.MXX` (matte) and `.GXX`
+/// (gloss) variants of one product on the same default output filename
+/// (`specs/cli/spec.md`, "A product identifier is not truncated at its
+/// dots").
+pub fn default_output_path_from_stem(
+    stem: &str,
+    role: OutputRole,
+    output_dir: &Utf8Path,
+) -> Utf8PathBuf {
     output_dir.join(format!("{stem}{}.pdf", role.suffix()))
 }
 
@@ -76,6 +94,22 @@ mod tests {
         let input = Utf8Path::new("/tmp/book.pdf");
         let path = default_output_path(input, OutputRole::Cover, Utf8Path::new("."));
         assert_eq!(path, Utf8PathBuf::from("./book-cover.pdf"));
+    }
+
+    #[test]
+    fn default_cover_path_from_a_sku_keeps_the_full_dotted_identifier() {
+        // A SKU is not a file path: its trailing dotted segment must not be
+        // treated as an extension and dropped, or the .MXX/.GXX variants of
+        // one product would collide on the same default filename.
+        let path = default_output_path_from_stem(
+            "0600X0900.BW.STD.PB.060UW444.MXX",
+            OutputRole::Cover,
+            Utf8Path::new("."),
+        );
+        assert_eq!(
+            path,
+            Utf8PathBuf::from("./0600X0900.BW.STD.PB.060UW444.MXX-cover.pdf")
+        );
     }
 
     #[test]

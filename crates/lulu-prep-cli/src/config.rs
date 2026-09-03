@@ -2,6 +2,13 @@
 //! user config file > built-in defaults (`specs/cli/spec.md`, "Configuration
 //! precedence"). Every resolved value remembers which layer it came from so
 //! the effective configuration can be printed with sources named.
+//!
+//! A value that is *present* at some layer but fails to parse is a hard
+//! error naming the option, the offending value, and the accepted values
+//! (`specs/cli/spec.md`, "An invalid option value is an error, never a
+//! silent default") — it must never fall through to a lower-precedence layer
+//! or the built-in default, since that would silently change the run's
+//! geometry while appearing to honour the request.
 
 use lulu_prep::normalize::FitMode;
 use serde::Deserialize;
@@ -35,7 +42,10 @@ pub struct Resolved<T> {
 
 /// Picks the highest-precedence `Some` among the four layers, falling back
 /// to `default`. Each layer is optional because a given setting need not be
-/// specified at every level.
+/// specified at every level. Only usable for settings whose layer values can
+/// never fail to parse (a plain string, or a bool already typed by TOML) —
+/// see `resolve_fit_mode`/`resolve_strict`/`resolve_gutter_floor_in` for
+/// settings that need per-layer parse-failure detection instead.
 fn resolve<T>(
     flag: Option<T>,
     env: Option<T>,
@@ -100,6 +110,10 @@ impl ConfigFile {
     }
 }
 
+pub const FIT_MODE_ACCEPTED: &str = "center, scale-to-bleed, stretch-margins";
+pub const BOOL_ACCEPTED: &str = "true, false, yes, no, on, off, 1, 0";
+pub const GUTTER_FLOOR_ACCEPTED: &str = "a floating-point number of inches, e.g. 0.25";
+
 fn parse_fit_mode(s: &str) -> Option<FitMode> {
     match s.to_lowercase().as_str() {
         "center" | "centre" => Some(FitMode::Center),
@@ -146,6 +160,9 @@ fn parse_bool_env(s: &str) -> Option<bool> {
 
 /// Flags parsed from the command line — every field `None` means "not
 /// passed", letting the precedence chain fall through to lower layers.
+/// `clap` itself already rejects an unparseable `--fit-mode` or
+/// `--gutter-floor-in` before this struct is built, so no flag-layer value
+/// here can be "present but invalid".
 #[derive(Debug, Clone, Default)]
 pub struct Flags {
     pub fit_mode: Option<FitMode>,
@@ -167,49 +184,229 @@ pub struct EffectiveConfig {
 pub const DEFAULT_OUTPUT_DIR: &str = ".";
 pub const DEFAULT_GUTTER_FLOOR_IN: f64 = 0.0;
 
-/// Resolves the effective configuration across all four layers. `project`
-/// and `user` are `None` when the corresponding config file doesn't exist —
-/// a missing file is not an error, it just contributes nothing.
+/// A value was supplied for `option` at `location` but could not be parsed —
+/// exit code 2, per `specs/cli/spec.md`'s "An invalid option value is an
+/// error, never a silent default".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    pub option: &'static str,
+    pub location: String,
+    pub value: String,
+    pub accepted: &'static str,
+}
+
+impl ConfigError {
+    fn new(
+        option: &'static str,
+        location: impl Into<String>,
+        value: impl Into<String>,
+        accepted: &'static str,
+    ) -> ConfigError {
+        ConfigError {
+            option,
+            location: location.into(),
+            value: value.into(),
+            accepted,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid value for {} ({}): '{}'; accepted values: {}",
+            self.option, self.location, self.value, self.accepted
+        )
+    }
+}
+
+/// Resolves `fit_mode` across all four layers, failing on the first layer
+/// that has a value present but unparseable rather than continuing on to a
+/// lower-precedence layer.
+fn resolve_fit_mode(
+    flags: &Flags,
+    env: &EnvVars,
+    project: Option<&ConfigFile>,
+    user: Option<&ConfigFile>,
+) -> Result<Resolved<FitMode>, ConfigError> {
+    if let Some(value) = flags.fit_mode {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::Flag,
+        });
+    }
+    if let Some(raw) = &env.fit_mode {
+        return parse_fit_mode(raw)
+            .map(|value| Resolved {
+                value,
+                source: ConfigSource::Env,
+            })
+            .ok_or_else(|| {
+                ConfigError::new(
+                    "fit_mode",
+                    "environment variable LULU_PREP_FIT_MODE",
+                    raw.clone(),
+                    FIT_MODE_ACCEPTED,
+                )
+            });
+    }
+    if let Some(raw) = project.and_then(|c| c.fit_mode.as_deref()) {
+        return parse_fit_mode(raw)
+            .map(|value| Resolved {
+                value,
+                source: ConfigSource::ProjectFile,
+            })
+            .ok_or_else(|| {
+                ConfigError::new(
+                    "fit_mode",
+                    "project config file's fit_mode",
+                    raw,
+                    FIT_MODE_ACCEPTED,
+                )
+            });
+    }
+    if let Some(raw) = user.and_then(|c| c.fit_mode.as_deref()) {
+        return parse_fit_mode(raw)
+            .map(|value| Resolved {
+                value,
+                source: ConfigSource::UserFile,
+            })
+            .ok_or_else(|| {
+                ConfigError::new(
+                    "fit_mode",
+                    "user config file's fit_mode",
+                    raw,
+                    FIT_MODE_ACCEPTED,
+                )
+            });
+    }
+    Ok(Resolved {
+        value: FitMode::default(),
+        source: ConfigSource::Default,
+    })
+}
+
+/// Resolves `strict` across all four layers. `clap` gives us a plain
+/// presence flag (never invalid) and TOML already types the file layers as
+/// `bool` (a type mismatch is a whole-file parse error, reported separately
+/// by `load_config_file`), so only the environment-variable layer can be
+/// "present but unparseable" here.
+fn resolve_strict(
+    flags: &Flags,
+    env: &EnvVars,
+    project: Option<&ConfigFile>,
+    user: Option<&ConfigFile>,
+) -> Result<Resolved<bool>, ConfigError> {
+    if let Some(value) = flags.strict {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::Flag,
+        });
+    }
+    if let Some(raw) = &env.strict {
+        return parse_bool_env(raw)
+            .map(|value| Resolved {
+                value,
+                source: ConfigSource::Env,
+            })
+            .ok_or_else(|| {
+                ConfigError::new(
+                    "strict",
+                    "environment variable LULU_PREP_STRICT",
+                    raw.clone(),
+                    BOOL_ACCEPTED,
+                )
+            });
+    }
+    if let Some(value) = project.and_then(|c| c.strict) {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::ProjectFile,
+        });
+    }
+    if let Some(value) = user.and_then(|c| c.strict) {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::UserFile,
+        });
+    }
+    Ok(Resolved {
+        value: false,
+        source: ConfigSource::Default,
+    })
+}
+
+/// Resolves `gutter_floor_in` across all four layers; only the
+/// environment-variable layer carries a raw string that can fail to parse
+/// (the flag is already an `f64` via `clap`, and the file layers are already
+/// typed `f64` via TOML).
+fn resolve_gutter_floor_in(
+    flags: &Flags,
+    env: &EnvVars,
+    project: Option<&ConfigFile>,
+    user: Option<&ConfigFile>,
+) -> Result<Resolved<f64>, ConfigError> {
+    if let Some(value) = flags.gutter_floor_in {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::Flag,
+        });
+    }
+    if let Some(raw) = &env.gutter_floor_in {
+        return raw
+            .parse::<f64>()
+            .map(|value| Resolved {
+                value,
+                source: ConfigSource::Env,
+            })
+            .map_err(|_| {
+                ConfigError::new(
+                    "gutter_floor_in",
+                    "environment variable LULU_PREP_GUTTER_FLOOR_IN",
+                    raw.clone(),
+                    GUTTER_FLOOR_ACCEPTED,
+                )
+            });
+    }
+    if let Some(value) = project.and_then(|c| c.gutter_floor_in) {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::ProjectFile,
+        });
+    }
+    if let Some(value) = user.and_then(|c| c.gutter_floor_in) {
+        return Ok(Resolved {
+            value,
+            source: ConfigSource::UserFile,
+        });
+    }
+    Ok(Resolved {
+        value: DEFAULT_GUTTER_FLOOR_IN,
+        source: ConfigSource::Default,
+    })
+}
+
+/// Resolves the effective configuration across all four layers, or the
+/// first parse failure encountered (searched in precedence order, per
+/// setting). `project` and `user` are `None` when the corresponding config
+/// file doesn't exist — a missing file is not an error, it just contributes
+/// nothing.
 pub fn resolve_config(
     flags: &Flags,
     env: &EnvVars,
     project: Option<&ConfigFile>,
     user: Option<&ConfigFile>,
-) -> EffectiveConfig {
-    let project_fit_mode = project
-        .and_then(|c| c.fit_mode.as_deref())
-        .and_then(parse_fit_mode);
-    let user_fit_mode = user
-        .and_then(|c| c.fit_mode.as_deref())
-        .and_then(parse_fit_mode);
-    let env_fit_mode = env.fit_mode.as_deref().and_then(parse_fit_mode);
-
+) -> Result<EffectiveConfig, ConfigError> {
     let project_output_dir = project.and_then(|c| c.output_dir.clone());
     let user_output_dir = user.and_then(|c| c.output_dir.clone());
-
-    let project_strict = project.and_then(|c| c.strict);
-    let user_strict = user.and_then(|c| c.strict);
-    let env_strict = env.strict.as_deref().and_then(parse_bool_env);
 
     let project_no_color = project.and_then(|c| c.no_color);
     let user_no_color = user.and_then(|c| c.no_color);
     let env_no_color = env.no_color.as_ref().map(|s| !s.is_empty());
 
-    let project_gutter = project.and_then(|c| c.gutter_floor_in);
-    let user_gutter = user.and_then(|c| c.gutter_floor_in);
-    let env_gutter = env
-        .gutter_floor_in
-        .as_deref()
-        .and_then(|s| s.parse::<f64>().ok());
-
-    EffectiveConfig {
-        fit_mode: resolve(
-            flags.fit_mode,
-            env_fit_mode,
-            project_fit_mode,
-            user_fit_mode,
-            FitMode::default(),
-        ),
+    Ok(EffectiveConfig {
+        fit_mode: resolve_fit_mode(flags, env, project, user)?,
         output_dir: resolve(
             flags.output_dir.clone(),
             env.output_dir.clone(),
@@ -217,7 +414,7 @@ pub fn resolve_config(
             user_output_dir,
             DEFAULT_OUTPUT_DIR.to_string(),
         ),
-        strict: resolve(flags.strict, env_strict, project_strict, user_strict, false),
+        strict: resolve_strict(flags, env, project, user)?,
         no_color: resolve(
             flags.no_color,
             env_no_color,
@@ -225,14 +422,8 @@ pub fn resolve_config(
             user_no_color,
             false,
         ),
-        gutter_floor_in: resolve(
-            flags.gutter_floor_in,
-            env_gutter,
-            project_gutter,
-            user_gutter,
-            DEFAULT_GUTTER_FLOOR_IN,
-        ),
-    }
+        gutter_floor_in: resolve_gutter_floor_in(flags, env, project, user)?,
+    })
 }
 
 fn fit_mode_label(mode: FitMode) -> &'static str {
@@ -282,7 +473,7 @@ mod tests {
 
     #[test]
     fn all_defaults_when_nothing_set() {
-        let config = resolve_config(&Flags::default(), &EnvVars::default(), None, None);
+        let config = resolve_config(&Flags::default(), &EnvVars::default(), None, None).unwrap();
         assert_eq!(config.fit_mode.value, FitMode::Center);
         assert_eq!(config.fit_mode.source, ConfigSource::Default);
         assert_eq!(config.output_dir.value, DEFAULT_OUTPUT_DIR);
@@ -300,7 +491,7 @@ mod tests {
             fit_mode: Some(FitMode::StretchMargins),
             ..Default::default()
         };
-        let config = resolve_config(&flags, &EnvVars::default(), Some(&project), None);
+        let config = resolve_config(&flags, &EnvVars::default(), Some(&project), None).unwrap();
         assert_eq!(config.fit_mode.value, FitMode::StretchMargins);
         assert_eq!(config.fit_mode.source, ConfigSource::Flag);
     }
@@ -320,7 +511,8 @@ mod tests {
             &EnvVars::default(),
             Some(&project),
             Some(&user),
-        );
+        )
+        .unwrap();
         assert!(config.strict.value);
         assert_eq!(config.strict.source, ConfigSource::ProjectFile);
 
@@ -328,7 +520,7 @@ mod tests {
             strict: Some("0".to_string()),
             ..Default::default()
         };
-        let config = resolve_config(&Flags::default(), &env, Some(&project), Some(&user));
+        let config = resolve_config(&Flags::default(), &env, Some(&project), Some(&user)).unwrap();
         assert!(!config.strict.value);
         assert_eq!(config.strict.source, ConfigSource::Env);
     }
@@ -339,7 +531,8 @@ mod tests {
             output_dir: Some("/home/me/out".to_string()),
             ..Default::default()
         };
-        let config = resolve_config(&Flags::default(), &EnvVars::default(), None, Some(&user));
+        let config =
+            resolve_config(&Flags::default(), &EnvVars::default(), None, Some(&user)).unwrap();
         assert_eq!(config.output_dir.value, "/home/me/out");
         assert_eq!(config.output_dir.source, ConfigSource::UserFile);
     }
@@ -350,7 +543,7 @@ mod tests {
             no_color: Some("1".to_string()),
             ..Default::default()
         };
-        let config = resolve_config(&Flags::default(), &env, None, None);
+        let config = resolve_config(&Flags::default(), &env, None, None).unwrap();
         assert!(config.no_color.value);
         assert_eq!(config.no_color.source, ConfigSource::Env);
     }
@@ -361,7 +554,7 @@ mod tests {
             strict: Some(true),
             ..Default::default()
         };
-        let config = resolve_config(&flags, &EnvVars::default(), None, None);
+        let config = resolve_config(&flags, &EnvVars::default(), None, None).unwrap();
         let lines = config.display_lines();
         assert!(lines
             .iter()
@@ -382,5 +575,81 @@ mod tests {
     fn config_file_rejects_invalid_toml() {
         let err = ConfigFile::parse("this is not [ valid toml").unwrap_err();
         assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn misspelled_env_fit_mode_is_an_error_not_a_silent_default() {
+        let env = EnvVars {
+            fit_mode: Some("scaletobleed".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_config(&Flags::default(), &env, None, None).unwrap_err();
+        assert_eq!(err.option, "fit_mode");
+        assert!(err.location.contains("LULU_PREP_FIT_MODE"));
+        assert!(err.value.contains("scaletobleed"));
+        assert!(err.accepted.contains("center"));
+        assert!(err.accepted.contains("scale-to-bleed"));
+        assert!(err.accepted.contains("stretch-margins"));
+    }
+
+    #[test]
+    fn misspelled_env_fit_mode_does_not_fall_through_to_project_file() {
+        // A valid project-file fit_mode must NOT be used as a fallback once
+        // the higher-precedence environment layer is present-but-invalid.
+        let project = ConfigFile {
+            fit_mode: Some("center".to_string()),
+            ..Default::default()
+        };
+        let env = EnvVars {
+            fit_mode: Some("scaletobleed".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_config(&Flags::default(), &env, Some(&project), None).unwrap_err();
+        assert_eq!(err.option, "fit_mode");
+    }
+
+    #[test]
+    fn unparseable_env_strict_is_an_error_not_a_silent_disable() {
+        let env = EnvVars {
+            strict: Some("yes-please".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_config(&Flags::default(), &env, None, None).unwrap_err();
+        assert_eq!(err.option, "strict");
+        assert!(err.location.contains("LULU_PREP_STRICT"));
+    }
+
+    #[test]
+    fn unparseable_env_gutter_floor_is_an_error() {
+        let env = EnvVars {
+            gutter_floor_in: Some("not-a-number".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_config(&Flags::default(), &env, None, None).unwrap_err();
+        assert_eq!(err.option, "gutter_floor_in");
+        assert!(err.location.contains("LULU_PREP_GUTTER_FLOOR_IN"));
+    }
+
+    #[test]
+    fn invalid_project_file_fit_mode_is_an_error() {
+        let project = ConfigFile {
+            fit_mode: Some("sideways".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_config(&Flags::default(), &EnvVars::default(), Some(&project), None)
+            .unwrap_err();
+        assert_eq!(err.option, "fit_mode");
+        assert!(err.location.contains("project config"));
+    }
+
+    #[test]
+    fn valid_gutter_floor_flag_is_consumed_as_is() {
+        let flags = Flags {
+            gutter_floor_in: Some(0.3),
+            ..Default::default()
+        };
+        let config = resolve_config(&flags, &EnvVars::default(), None, None).unwrap();
+        assert_eq!(config.gutter_floor_in.value, 0.3);
+        assert_eq!(config.gutter_floor_in.source, ConfigSource::Flag);
     }
 }

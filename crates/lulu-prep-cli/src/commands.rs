@@ -9,7 +9,8 @@ use lulu_prep::cover::{
 use lulu_prep::normalize::{self, FitMode, NormalizeOptions};
 use lulu_prep::pdf::{self, LoadError};
 use lulu_prep::pipeline::{self, PipelineError, PipelineOptions};
-use lulu_prep::report::{now_rfc3339, Report, SCHEMA_VERSION};
+use lulu_prep::report::{now_rfc3339, Finding, Report, Severity, SCHEMA_VERSION};
+use serde::{Deserialize, Serialize};
 
 pub struct CheckOutcome {
     pub report: Report,
@@ -177,6 +178,119 @@ pub fn run_book(
     Ok(BookOutcome { interior, cover })
 }
 
+/// The combined report `book` emits: one document carrying both the
+/// interior's and the cover's `Report`, rather than the two concatenated
+/// separately — the latter is not parseable as a single JSON document and
+/// truncates when written to one `--report-out` path
+/// (`specs/cli/spec.md`, "A two-file command emits one document" and "A
+/// two-file command does not truncate a report file").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BookReport {
+    pub interior: Report,
+    pub cover: Report,
+}
+
+impl BookReport {
+    pub fn blocking_count(&self) -> usize {
+        self.interior.blocking_count() + self.cover.blocking_count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.interior.warning_count() + self.cover.warning_count()
+    }
+
+    pub fn is_print_ready(&self) -> bool {
+        self.interior.is_print_ready() && self.cover.is_print_ready()
+    }
+
+    /// One line stating the verdict, product, and final page count, across
+    /// both documents (`specs/cli/spec.md`, "Report leads with the
+    /// verdict").
+    pub fn verdict_line(&self) -> String {
+        let product = self
+            .interior
+            .product_sku
+            .as_deref()
+            .or(self.cover.product_sku.as_deref());
+        if self.is_print_ready() {
+            let mut parts = vec!["print-ready".to_string()];
+            if let Some(sku) = product {
+                parts.push(format!("for {sku}"));
+            }
+            if let Some(pages) = self.interior.page_count {
+                parts.push(format!("at {pages} pages"));
+            }
+            parts.push("(interior + cover)".to_string());
+            let mut line = parts.join(" ");
+            let warnings = self.warning_count();
+            if warnings > 0 {
+                line.push_str(&format!(
+                    " ({warnings} warning{} remaining)",
+                    if warnings == 1 { "" } else { "s" }
+                ));
+            }
+            line
+        } else {
+            format!(
+                "not print-ready: {} blocking issue{}, {} warning{} across interior and cover",
+                self.blocking_count(),
+                if self.blocking_count() == 1 { "" } else { "s" },
+                self.warning_count(),
+                if self.warning_count() == 1 { "" } else { "s" },
+            )
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Human-readable text leading with the combined verdict, then each
+    /// document's own rendering, indented under its own heading.
+    pub fn to_text(&self) -> String {
+        let mut out = self.verdict_line();
+        out.push('\n');
+        out.push_str("\nInterior:\n");
+        out.push_str(&indent_lines(&self.interior.to_text()));
+        out.push_str("\n\nCover:\n");
+        out.push_str(&indent_lines(&self.cover.to_text()));
+        out
+    }
+}
+
+fn indent_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Advisory findings from `--gutter-floor-in`: the CLI's own comparison of
+/// the library's page-count-banded gutter (`lulu_prep::geometry::
+/// gutter_allowance`, the same function `normalize_interior` itself calls)
+/// against a user-configured floor, independent of the library's own fixed
+/// 0.2 in advisory constant. A floor of 0.0 (the default, when the option
+/// isn't set at any layer) can never trigger, since the applied gutter is
+/// never negative — so leaving `--gutter-floor-in` unset is a true no-op,
+/// not a silently-ignored flag.
+pub fn gutter_floor_findings(page_count: u32, floor_in: f64) -> Vec<Finding> {
+    let allowance = lulu_prep::geometry::gutter_allowance(page_count);
+    let actual_in = allowance.gutter.as_inches();
+    if actual_in < floor_in {
+        vec![Finding::new(
+            "gutter.below-configured-floor",
+            Severity::Warning,
+            format!(
+                "at {page_count} pages, the applied gutter is {actual_in:.3} in, below the --gutter-floor-in threshold of {floor_in:.3} in"
+            ),
+        )
+        .with_observed(format!("{actual_in:.3} in"))
+        .with_expected(format!(">= {floor_in:.3} in"))]
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +395,84 @@ mod tests {
             outcome.interior.report.page_count.unwrap()
         );
         assert_ne!(outcome.cover.geometry.page_count, 1);
+    }
+
+    fn empty_report(sku: &str, page_count: u32) -> Report {
+        Report {
+            schema_version: SCHEMA_VERSION,
+            input_digest: None,
+            product_sku: Some(sku.to_string()),
+            page_count: Some(page_count),
+            catalog_fetch_date: None,
+            tool_version: "test".to_string(),
+            detected_tools: vec![],
+            stages: vec![],
+            findings: vec![],
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn book_report_json_is_one_parseable_document_with_both_reports() {
+        let book_report = BookReport {
+            interior: empty_report("sku-a", 32),
+            cover: empty_report("sku-a", 32),
+        };
+        let json = book_report.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("interior").is_some());
+        assert!(value.get("cover").is_some());
+    }
+
+    #[test]
+    fn book_report_text_leads_with_a_combined_verdict() {
+        let book_report = BookReport {
+            interior: empty_report("sku-a", 32),
+            cover: empty_report("sku-a", 32),
+        };
+        let text = book_report.to_text();
+        let first_line = text.lines().next().unwrap();
+        assert!(first_line.starts_with("print-ready"));
+        assert!(first_line.contains("sku-a"));
+        assert!(first_line.contains("32 pages"));
+        assert!(text.contains("Interior:"));
+        assert!(text.contains("Cover:"));
+    }
+
+    #[test]
+    fn book_report_verdict_is_not_print_ready_if_either_side_has_a_blocking_finding() {
+        let mut cover = empty_report("sku-a", 32);
+        cover.findings.push(Finding::new(
+            "structure.encrypted",
+            Severity::Blocking,
+            "encrypted",
+        ));
+        let book_report = BookReport {
+            interior: empty_report("sku-a", 32),
+            cover,
+        };
+        assert!(!book_report.is_print_ready());
+        assert!(book_report.verdict_line().starts_with("not print-ready"));
+    }
+
+    #[test]
+    fn gutter_floor_findings_is_empty_when_actual_gutter_meets_the_floor() {
+        // 212 pages -> 0.5 in gutter per the banded table; a 0.3 in floor is met.
+        assert!(gutter_floor_findings(212, 0.3).is_empty());
+    }
+
+    #[test]
+    fn gutter_floor_findings_warns_when_actual_gutter_is_below_the_configured_floor() {
+        // 32 pages -> 0.0 in gutter per the banded table; any positive floor trips it.
+        let findings = gutter_floor_findings(32, 0.3);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn gutter_floor_findings_is_a_true_no_op_at_the_default_zero_floor() {
+        for pages in [1, 32, 100, 212, 500, 700] {
+            assert!(gutter_floor_findings(pages, 0.0).is_empty());
+        }
     }
 }

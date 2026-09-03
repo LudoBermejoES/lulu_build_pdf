@@ -9,7 +9,9 @@ use lulu_prep::normalize::{FitMode, NormalizeOptions};
 use lulu_prep::pipeline::PipelineOptions;
 use lulu_prep::report::Report;
 
-use lulu_prep_cli::commands::{self, BookCommandError, CoverCommandError, CoverSource};
+use lulu_prep::pod_package_id::PodPackageId;
+
+use lulu_prep_cli::commands::{self, BookCommandError, BookReport, CoverCommandError, CoverSource};
 use lulu_prep_cli::config::{self, ConfigFile, EnvVars, Flags};
 use lulu_prep_cli::exit_code::{exit_code_for_report, ExitCode};
 use lulu_prep_cli::output_paths::{self, OutputRole};
@@ -77,10 +79,20 @@ struct Cli {
     /// Promote warnings to a non-zero exit code. Default: false.
     #[arg(long, global = true)]
     strict: bool,
-    /// Disable colour in text output (also respects the NO_COLOR environment variable). Default: false.
+    /// Disable colour in text output (also respects the NO_COLOR environment
+    /// variable). Currently a no-op in practice: no report renderer in this
+    /// tool emits ANSI colour, so text output never contains escape
+    /// sequences regardless of this flag; accepted and resolved (visible via
+    /// --print-config) so scripts that pass it keep working if colour output
+    /// is ever added. Default: false.
     #[arg(long, global = true)]
     no_color: bool,
-    /// Minimum gutter width to advise, in inches. Default: 0.0 in.
+    /// Minimum gutter width to advise, in inches: raises the CLI's own
+    /// advisory threshold (independent of the library's fixed 0.2 in
+    /// advisory floor) that a run's applied gutter is compared against,
+    /// producing a warning finding when the applied gutter falls short. Does
+    /// not change the applied gutter itself. Default: 0.0 in (never
+    /// triggers, since the applied gutter is never negative).
     #[arg(long, global = true)]
     gutter_floor_in: Option<f64>,
 
@@ -198,10 +210,14 @@ fn parse_trim(s: &str) -> Option<(f64, f64)> {
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
-fn build_selector(cli: &Cli) -> Result<ProductSelector, String> {
-    if let Some(sku) = &cli.sku {
-        return Ok(ProductSelector::Sku(sku.clone()));
-    }
+/// Parses the component-selection flags shared by every command
+/// (`--trim`/`--binding`/`--ink`/`--quality`/`--paper`/`--lamination`),
+/// erroring on an unparseable `--trim`/`--binding` rather than silently
+/// dropping it — the same validation `build_selector` applies, reused here
+/// so `products` cannot silently list the whole catalog on a typo'd filter
+/// (`specs/cli/spec.md`, "An invalid option value is an error, never a
+/// silent default").
+fn parse_component_filter(cli: &Cli) -> Result<ComponentFilter, String> {
     let trim_in = match &cli.trim {
         Some(s) => Some(
             parse_trim(s).ok_or_else(|| format!("invalid --trim '{s}', expected e.g. '6x9'"))?,
@@ -212,14 +228,21 @@ fn build_selector(cli: &Cli) -> Result<ProductSelector, String> {
         Some(s) => Some(parse_binding(s).ok_or_else(|| format!("invalid --binding '{s}'"))?),
         None => None,
     };
-    Ok(ProductSelector::Components(ComponentFilter {
+    Ok(ComponentFilter {
         trim_in,
         binding,
         ink: cli.ink.clone(),
         quality: cli.quality.clone(),
         paper: cli.paper.clone(),
         lamination: cli.lamination.clone(),
-    }))
+    })
+}
+
+fn build_selector(cli: &Cli) -> Result<ProductSelector, String> {
+    if let Some(sku) = &cli.sku {
+        return Ok(ProductSelector::Sku(sku.clone()));
+    }
+    Ok(ProductSelector::Components(parse_component_filter(cli)?))
 }
 
 fn load_config_file(path: &Utf8Path) -> Option<ConfigFile> {
@@ -244,7 +267,7 @@ fn user_config_path() -> Option<Utf8PathBuf> {
     )
 }
 
-fn build_effective_config(cli: &Cli) -> config::EffectiveConfig {
+fn build_effective_config(cli: &Cli) -> Result<config::EffectiveConfig, config::ConfigError> {
     let flags = Flags {
         fit_mode: cli.fit_mode.map(Into::into),
         output_dir: cli.output_dir.clone(),
@@ -258,26 +281,47 @@ fn build_effective_config(cli: &Cli) -> config::EffectiveConfig {
     config::resolve_config(&flags, &env, project.as_ref(), user.as_ref())
 }
 
+/// Validates a `--doc-id` value bytewise via `is_ascii_hexdigit()` rather
+/// than slicing by an assumed byte-length, so a 32-*byte* string containing
+/// a multi-byte UTF-8 character (fewer than 32 actual characters) is
+/// rejected cleanly instead of panicking on a non-char-boundary slice
+/// (`specs/cli/spec.md`, "A malformed document identifier is rejected
+/// cleanly").
 fn parse_doc_id(hex: &str) -> Result<[u8; 16], String> {
-    if hex.len() != 32 {
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
-            "--doc-id must be exactly 32 hex characters, got {}",
-            hex.len()
+            "--doc-id must be exactly 32 hexadecimal characters (0-9, a-f, A-F), got '{hex}'"
         ));
     }
+    // Every byte was just validated as an ASCII hex digit, so `hex` is pure
+    // ASCII and every byte offset below is also a char boundary.
     let mut out = [0u8; 16];
     for (i, chunk) in out.iter_mut().enumerate() {
         *chunk = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("--doc-id is not valid hex: '{hex}'"))?;
+            .expect("validated ascii hexdigit pairs always parse");
     }
     Ok(out)
 }
 
 /// Applies `--doc-id`/`--creation-date` to `bytes` if both were supplied, for
-/// byte-identical repeat runs (`specs/cli/spec.md`, "Deterministic PDF identity").
+/// byte-identical repeat runs (`specs/cli/spec.md`, "Deterministic PDF
+/// identity"). Supplying only one of the pair is reported rather than
+/// silently producing non-reproducible output (`specs/cli/spec.md`, "A
+/// partially specified reproducibility request is reported").
 fn apply_determinism(cli: &Cli, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    let (Some(doc_id_hex), Some(creation_date)) = (&cli.doc_id, &cli.creation_date) else {
-        return Ok(bytes);
+    let (doc_id_hex, creation_date) = match (&cli.doc_id, &cli.creation_date) {
+        (None, None) => return Ok(bytes),
+        (Some(_), None) => {
+            return Err(
+                "--doc-id was supplied without --creation-date; both are required for byte-identical output".to_string(),
+            )
+        }
+        (None, Some(_)) => {
+            return Err(
+                "--creation-date was supplied without --doc-id; both are required for byte-identical output".to_string(),
+            )
+        }
+        (Some(doc_id_hex), Some(creation_date)) => (doc_id_hex, creation_date),
     };
     let doc_id = parse_doc_id(doc_id_hex)?;
     let mut doc = lulu_prep::pdf::load_from_bytes(&bytes).map_err(|e| e.to_string())?;
@@ -288,12 +332,7 @@ fn apply_determinism(cli: &Cli, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn print_report(cli: &Cli, report: &Report) -> std::io::Result<()> {
-    let text = if cli.json {
-        report.to_json().expect("Report always serializes")
-    } else {
-        report.to_text()
-    };
+fn write_report_output(cli: &Cli, text: &str) -> std::io::Result<()> {
     match &cli.report_out {
         Some(path) => std::fs::write(path, text)?,
         None => {
@@ -305,17 +344,63 @@ fn print_report(cli: &Cli, report: &Report) -> std::io::Result<()> {
     Ok(())
 }
 
+fn print_report(cli: &Cli, report: &Report) -> std::io::Result<()> {
+    let text = if cli.json {
+        report.to_json().expect("Report always serializes")
+    } else {
+        report.to_text()
+    };
+    write_report_output(cli, &text)
+}
+
+/// `book`'s combined report: one document instead of the interior's and the
+/// cover's printed or written separately (`specs/cli/spec.md`, "A two-file
+/// command emits one document").
+fn print_book_report(cli: &Cli, report: &BookReport) -> std::io::Result<()> {
+    let text = if cli.json {
+        report.to_json().expect("BookReport always serializes")
+    } else {
+        report.to_text()
+    };
+    write_report_output(cli, &text)
+}
+
+/// What a default output path is derived from when `--output`/`-o` isn't
+/// given: either an actual input file's path (stem taken via `file_stem()`),
+/// or a raw identifier string such as a product SKU, used in full and never
+/// treated as a file path (`specs/cli/spec.md`, "A product identifier is
+/// not truncated at its dots").
+enum DefaultName {
+    Path(Utf8PathBuf),
+    Stem(String),
+}
+
+/// Converts a CLI-supplied path to UTF-8, returning exit 2 with a clear
+/// message instead of panicking on a non-UTF-8 path (possible on Unix)
+/// (`specs/cli/spec.md`, "A non-UTF-8 output path is rejected cleanly").
+fn require_utf8_path(path: &std::path::Path, what: &str) -> Result<Utf8PathBuf, ExitCode> {
+    Utf8PathBuf::from_path_buf(path.to_path_buf()).map_err(|_| {
+        eprintln!("{what} is not valid UTF-8: {}", path.display());
+        ExitCode::InvalidUsage
+    })
+}
+
 fn write_output(
     cli: &Cli,
-    input: &Utf8Path,
+    default_name: &DefaultName,
     role: OutputRole,
     output_dir: &Utf8Path,
     explicit: Option<&PathBuf>,
     bytes: &[u8],
 ) -> Result<Utf8PathBuf, ExitCode> {
     let path = match explicit {
-        Some(p) => Utf8PathBuf::from_path_buf(p.clone()).expect("output path must be valid UTF-8"),
-        None => output_paths::default_output_path(input, role, output_dir),
+        Some(p) => require_utf8_path(p, "output path")?,
+        None => match default_name {
+            DefaultName::Path(p) => output_paths::default_output_path(p, role, output_dir),
+            DefaultName::Stem(s) => {
+                output_paths::default_output_path_from_stem(s, role, output_dir)
+            }
+        },
     };
     if let Err(refused) = output_paths::check_overwrite(&path, cli.force, |p| p.exists()) {
         eprintln!("{refused}");
@@ -333,10 +418,6 @@ fn write_output(
     Ok(path)
 }
 
-fn resolve_input_utf8(path: &std::path::Path) -> Utf8PathBuf {
-    Utf8PathBuf::from_path_buf(path.to_path_buf()).expect("input path must be valid UTF-8")
-}
-
 fn pipeline_options(cli: &Cli) -> PipelineOptions {
     PipelineOptions {
         qpdf_path: cli.qpdf_path.clone(),
@@ -352,32 +433,45 @@ fn pipeline_options(cli: &Cli) -> PipelineOptions {
 fn main() {
     let cli = Cli::parse();
 
+    let effective = match build_effective_config(&cli) {
+        Ok(effective) => effective,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(ExitCode::InvalidUsage.as_i32());
+        }
+    };
+
     if cli.print_config {
-        for line in build_effective_config(&cli).display_lines() {
+        for line in effective.display_lines() {
             println!("{line}");
         }
         std::process::exit(ExitCode::Clean.as_i32());
     }
 
-    let effective = build_effective_config(&cli);
     let fit_mode: FitMode = effective.fit_mode.value;
     let output_dir = Utf8PathBuf::from(effective.output_dir.value.clone());
     let strict = effective.strict.value;
+    let gutter_floor_in = effective.gutter_floor_in.value;
 
-    let code = run(&cli, fit_mode, &output_dir, strict);
+    let code = run(&cli, fit_mode, &output_dir, strict, gutter_floor_in);
     std::process::exit(code.as_i32());
 }
 
-fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> ExitCode {
+fn run(
+    cli: &Cli,
+    fit_mode: FitMode,
+    output_dir: &Utf8Path,
+    strict: bool,
+    gutter_floor_in: f64,
+) -> ExitCode {
     match &cli.command {
         Command::Products => {
-            let filter = ComponentFilter {
-                trim_in: cli.trim.as_deref().and_then(parse_trim),
-                binding: cli.binding.as_deref().and_then(parse_binding),
-                ink: cli.ink.clone(),
-                quality: cli.quality.clone(),
-                paper: cli.paper.clone(),
-                lamination: cli.lamination.clone(),
+            let filter = match parse_component_filter(cli) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::InvalidUsage;
+                }
             };
             let entries = lulu_prep_cli::product_selection::search_catalog(&filter);
             println!("{}", format_products_table(&entries));
@@ -434,11 +528,18 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
                 apply_gutter: cli.gutter,
                 split_spreads: cli.split_spreads,
             };
-            let outcome =
+            let mut outcome =
                 match commands::run_interior(&bytes, product, options, &pipeline_options(cli)) {
                     Ok(o) => o,
                     Err(e) => return report_pipeline_error(&e),
                 };
+            outcome
+                .report
+                .findings
+                .extend(commands::gutter_floor_findings(
+                    outcome.report.page_count.unwrap_or(0),
+                    gutter_floor_in,
+                ));
             let output_bytes = match apply_determinism(cli, outcome.output_bytes) {
                 Ok(b) => b,
                 Err(e) => {
@@ -449,18 +550,19 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
             if print_report(cli, &outcome.report).is_err() {
                 return ExitCode::IoOrParse;
             }
-            let input_utf8 = resolve_input_utf8(input);
-            if write_output(
+            let input_utf8 = match require_utf8_path(input, "input path") {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            if let Err(code) = write_output(
                 cli,
-                &input_utf8,
+                &DefaultName::Path(input_utf8),
                 OutputRole::Interior,
                 output_dir,
                 output.as_ref(),
                 &output_bytes,
-            )
-            .is_err()
-            {
-                return ExitCode::InvalidUsage;
+            ) {
+                return code;
             }
             exit_code_for_report(&outcome.report, strict)
         }
@@ -504,21 +606,25 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
             if print_report(cli, &outcome.report).is_err() {
                 return ExitCode::IoOrParse;
             }
-            let input_name = supplied
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(&product.sku));
-            let input_utf8 = resolve_input_utf8(&input_name);
-            if write_output(
+            // A supplied cover derives its default name from that file's own
+            // path (stem); a generated template derives it from the full
+            // product SKU, never truncated at a dotted segment.
+            let default_name = match supplied {
+                Some(path) => match require_utf8_path(path, "supplied cover path") {
+                    Ok(p) => DefaultName::Path(p),
+                    Err(code) => return code,
+                },
+                None => DefaultName::Stem(product.sku.clone()),
+            };
+            if let Err(code) = write_output(
                 cli,
-                &input_utf8,
+                &default_name,
                 OutputRole::Cover,
                 output_dir,
                 output.as_ref(),
                 &output_bytes,
-            )
-            .is_err()
-            {
-                return ExitCode::InvalidUsage;
+            ) {
+                return code;
             }
             exit_code_for_report(&outcome.report, strict)
         }
@@ -561,7 +667,7 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
                 apply_gutter: cli.gutter,
                 split_spreads: cli.split_spreads,
             };
-            let outcome = match commands::run_book(
+            let mut outcome = match commands::run_book(
                 &bytes,
                 product,
                 options,
@@ -571,6 +677,14 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
                 Ok(o) => o,
                 Err(e) => return report_book_error(&e),
             };
+            outcome
+                .interior
+                .report
+                .findings
+                .extend(commands::gutter_floor_findings(
+                    outcome.interior.report.page_count.unwrap_or(0),
+                    gutter_floor_in,
+                ));
 
             let interior_bytes = match apply_determinism(cli, outcome.interior.output_bytes) {
                 Ok(b) => b,
@@ -587,37 +701,42 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
                 }
             };
 
-            if print_report(cli, &outcome.interior.report).is_err() {
-                return ExitCode::IoOrParse;
-            }
-            if print_report(cli, &outcome.cover.report).is_err() {
+            // One combined document, not the interior's and the cover's
+            // reports printed/written separately — the latter is not
+            // parseable as a single JSON document, and truncates a
+            // `--report-out` file (`specs/cli/spec.md`, "A two-file command
+            // emits one document").
+            let combined_report = BookReport {
+                interior: outcome.interior.report.clone(),
+                cover: outcome.cover.report.clone(),
+            };
+            if print_book_report(cli, &combined_report).is_err() {
                 return ExitCode::IoOrParse;
             }
 
-            let input_utf8 = resolve_input_utf8(input);
-            if write_output(
+            let input_utf8 = match require_utf8_path(input, "input path") {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            if let Err(code) = write_output(
                 cli,
-                &input_utf8,
+                &DefaultName::Path(input_utf8.clone()),
                 OutputRole::Interior,
                 output_dir,
                 interior_output.as_ref(),
                 &interior_bytes,
-            )
-            .is_err()
-            {
-                return ExitCode::InvalidUsage;
+            ) {
+                return code;
             }
-            if write_output(
+            if let Err(code) = write_output(
                 cli,
-                &input_utf8,
+                &DefaultName::Path(input_utf8),
                 OutputRole::Cover,
                 output_dir,
                 cover_output.as_ref(),
                 &cover_bytes,
-            )
-            .is_err()
-            {
-                return ExitCode::InvalidUsage;
+            ) {
+                return code;
             }
 
             let interior_code = exit_code_for_report(&outcome.interior.report, strict);
@@ -633,6 +752,24 @@ fn run(cli: &Cli, fit_mode: FitMode, output_dir: &Utf8Path, strict: bool) -> Exi
     }
 }
 
+/// Surfaces `pod_package_id`'s legacy-SKU deprecation notice as a
+/// side observation when `--sku` was given in the legacy 27-character
+/// form — resolution itself still goes through `catalog::lookup` (via
+/// `resolve_product`), which already accepts both forms; this only makes
+/// the deprecation visible instead of silently accepting a form Lulu
+/// retires on 2027-02-01 (`design.md`, "Dead capabilities are connected or
+/// removed, not left ambiguous").
+fn warn_if_legacy_sku(sku: &str) {
+    if let Ok(parsed) = PodPackageId::parse(sku) {
+        if let Some(notice) = parsed.deprecation {
+            eprintln!(
+                "warning: '{sku}' uses Lulu's legacy pod_package_id form, which Lulu stops accepting on {}; use '{}' instead",
+                notice.legacy_support_ends, notice.dotted_equivalent
+            );
+        }
+    }
+}
+
 fn resolve(cli: &Cli) -> Result<&'static CatalogEntry, ExitCode> {
     let selector = match build_selector(cli) {
         Ok(s) => s,
@@ -641,6 +778,9 @@ fn resolve(cli: &Cli) -> Result<&'static CatalogEntry, ExitCode> {
             return Err(ExitCode::InvalidUsage);
         }
     };
+    if let ProductSelector::Sku(sku) = &selector {
+        warn_if_legacy_sku(sku);
+    }
     match resolve_product(&selector) {
         Ok(entry) => Ok(entry),
         Err(SelectionError::NoComponentsGiven) => {
