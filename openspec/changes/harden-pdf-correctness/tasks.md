@@ -67,16 +67,16 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 7. CLI contracts
 
-- [ ] 7.1 Emit one combined report document for `book` (`{interior, cover}`) so `--json` is parseable and `--report-out` is not truncated by the second write
-- [ ] 7.2 Propagate `write_output`'s computed exit code instead of flattening every failure to 2
-- [ ] 7.3 Fail with exit 2 on an unparseable option value at any precedence layer, naming the option, the value, and the accepted values, rather than falling through to a default
-- [ ] 7.4 Wire `--gutter-floor-in` into the gutter advisory threshold, or remove the flag; `--print-config` must not display a value nothing reads
-- [ ] 7.5 Decide `--no-color`'s fate: either apply it to real colour output or remove it, so the flag is not inert
-- [ ] 7.6 Use the full SKU rather than `file_stem` when deriving a filename from a product identifier, so `.MXX` and `.GXX` cannot collide
-- [ ] 7.7 Validate `--doc-id` bytewise (`is_ascii_hexdigit`) so a multi-byte character cannot panic the slice, and report when only one of `--doc-id`/`--creation-date` is supplied
-- [ ] 7.8 Return exit 2 for a non-UTF-8 input or output path instead of `expect`-panicking
-- [ ] 7.9 Apply the same strict argument validation to `products` that `build_selector` applies elsewhere, so `--trim 6*9` errors rather than silently listing the whole catalog
-- [ ] 7.10 Surface `pod_package_id`'s legacy-SKU `DeprecationNotice` when a legacy 27-character SKU is used, or remove the module; it is currently unreachable from any command
+- [x] 7.1 Emit one combined report document for `book` (`{interior, cover}`) so `--json` is parseable and `--report-out` is not truncated by the second write
+- [x] 7.2 Propagate `write_output`'s computed exit code instead of flattening every failure to 2
+- [x] 7.3 Fail with exit 2 on an unparseable option value at any precedence layer, naming the option, the value, and the accepted values, rather than falling through to a default
+- [x] 7.4 Wire `--gutter-floor-in` into the gutter advisory threshold, or remove the flag; `--print-config` must not display a value nothing reads
+- [x] 7.5 Decide `--no-color`'s fate: either apply it to real colour output or remove it, so the flag is not inert
+- [x] 7.6 Use the full SKU rather than `file_stem` when deriving a filename from a product identifier, so `.MXX` and `.GXX` cannot collide
+- [x] 7.7 Validate `--doc-id` bytewise (`is_ascii_hexdigit`) so a multi-byte character cannot panic the slice, and report when only one of `--doc-id`/`--creation-date` is supplied
+- [x] 7.8 Return exit 2 for a non-UTF-8 input or output path instead of `expect`-panicking
+- [x] 7.9 Apply the same strict argument validation to `products` that `build_selector` applies elsewhere, so `--trim 6*9` errors rather than silently listing the whole catalog
+- [x] 7.10 Surface `pod_package_id`'s legacy-SKU `DeprecationNotice` when a legacy 27-character SKU is used, or remove the module; it is currently unreachable from any command
 
 ## 8. Documentation and consistency
 
