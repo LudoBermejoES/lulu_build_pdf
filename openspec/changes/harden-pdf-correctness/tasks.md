@@ -18,14 +18,14 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 2. Preflight sees through nesting
 
-- [ ] 2.1 Make `check_font_embedding` discover fonts through effective page resources and through every form XObject the page draws, reusing `ctm_walk`'s traversal rather than adding a second one
-- [ ] 2.2 Make `check_colour_and_ink` evaluate the content and resources of nested form XObjects as well as the page's own
-- [ ] 2.3 Add an operation budget to `ctm_walk` on top of `MAX_FORM_DEPTH`, and surface budget exhaustion as a blocking finding stating the checks are incomplete
-- [ ] 2.4 Add a blocking finding for a content stream naming a resource that cannot be resolved, keyed on the named operand rather than merely on an empty resource dictionary, so a genuinely blank page is not flagged
-- [ ] 2.5 Add a blocking finding for a page whose geometry cannot be resolved, and stop `continue`-skipping such pages in `check_page_size_matches_target` and `check_mixed_page_sizes`
-- [ ] 2.6 Add a finding for a `/Rotate` that is present but unreadable, or not a multiple of 90
-- [ ] 2.7 Give the low-tint finding its own code (`COLOUR_LOW_TINT`) rather than reusing `COLOUR_UNSUPPORTED_SPACE`, and move every bare string literal code into the `codes` registry
-- [ ] 2.8 Wire `geometry::interior_safety_margin` into an actual check of interior content against the safe area, or remove it
+- [x] 2.1 Make `check_font_embedding` discover fonts through effective page resources and through every form XObject the page draws, reusing `ctm_walk`'s traversal rather than adding a second one
+- [x] 2.2 Make `check_colour_and_ink` evaluate the content and resources of nested form XObjects as well as the page's own
+- [x] 2.3 Add an operation budget to `ctm_walk` on top of `MAX_FORM_DEPTH`, and surface budget exhaustion as a blocking finding stating the checks are incomplete
+- [x] 2.4 Add a blocking finding for a content stream naming a resource that cannot be resolved, keyed on the named operand rather than merely on an empty resource dictionary, so a genuinely blank page is not flagged
+- [x] 2.5 Add a blocking finding for a page whose geometry cannot be resolved, and stop `continue`-skipping such pages in `check_page_size_matches_target` and `check_mixed_page_sizes`
+- [x] 2.6 Add a finding for a `/Rotate` that is present but unreadable, or not a multiple of 90
+- [x] 2.7 Give the low-tint finding its own code (`COLOUR_LOW_TINT`) rather than reusing `COLOUR_UNSUPPORTED_SPACE`, and move every bare string literal code into the `codes` registry
+- [x] 2.8 Wire `geometry::interior_safety_margin` into an actual check of interior content against the safe area, or remove it
 
 ## 3. Normalization correctness
 
