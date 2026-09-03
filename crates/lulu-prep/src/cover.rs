@@ -733,12 +733,7 @@ fn copy_page_as_form(
 ) -> Result<lopdf::ObjectId, crate::pdf::PageGeometryError> {
     let own_rect = crate::pdf::own_box_rect(src, src_page_id)?;
     let content_bytes = src.get_page_content(src_page_id);
-    let resources_dict = src
-        .get_page_resources(src_page_id)
-        .ok()
-        .and_then(|(r, _)| r)
-        .cloned()
-        .unwrap_or_default();
+    let resources_dict = crate::pdf::effective_page_resources(src, src_page_id)?;
     let mut memo = std::collections::HashMap::new();
     let copied_resources = crate::pdf::deep_copy_object(
         dest,
@@ -959,12 +954,7 @@ fn extract_panel_as_preview_page(
     let full = to_origin.then(placement.transform);
 
     let content_bytes = cover_doc.get_page_content(cover_page_id);
-    let resources_dict = cover_doc
-        .get_page_resources(cover_page_id)
-        .ok()
-        .and_then(|(r, _)| r)
-        .cloned()
-        .unwrap_or_default();
+    let resources_dict = crate::pdf::effective_page_resources(cover_doc, cover_page_id)?;
     let mut memo = std::collections::HashMap::new();
     let copied_resources = crate::pdf::deep_copy_object(
         dest,

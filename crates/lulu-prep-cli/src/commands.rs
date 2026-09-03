@@ -63,6 +63,8 @@ pub enum CoverCommandError {
     Structural(#[from] CoverStructuralError),
     #[error("could not write the cover PDF: {0}")]
     Save(#[from] std::io::Error),
+    #[error("the supplied cover file has no pages")]
+    NoPages,
 }
 
 #[derive(Debug)]
@@ -116,10 +118,7 @@ pub fn run_cover(
                     CoverStructuralError::PasswordRequired,
                 ));
             }
-            let page_id = doc
-                .page_iter()
-                .next()
-                .expect("a supplied cover PDF has at least one page (checked by preflight before this runs)");
+            let page_id = doc.page_iter().next().ok_or(CoverCommandError::NoPages)?;
             let fit_findings = cover::fit_supplied_cover(&mut doc, page_id, &geometry, fit_mode)?;
             report.findings.extend(fit_findings);
             doc
@@ -370,6 +369,21 @@ mod tests {
             err,
             CoverCommandError::Geometry(CoverGeometryError::NonConformantPageCount { .. })
         ));
+    }
+
+    #[test]
+    fn a_supplied_cover_with_no_pages_is_a_clean_error_not_a_panic() {
+        let bytes = minimal_pdf(0, sku().bleed_size);
+        let err = run_cover(
+            sku(),
+            212,
+            CoverSource::Supplied {
+                bytes: &bytes,
+                fit_mode: FitMode::Center,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoverCommandError::NoPages));
     }
 
     #[test]

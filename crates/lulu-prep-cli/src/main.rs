@@ -811,6 +811,7 @@ fn report_cover_error(e: &CoverCommandError) -> ExitCode {
         CoverCommandError::Fit(_) => ExitCode::IoOrParse,
         CoverCommandError::Structural(_) => ExitCode::IoOrParse,
         CoverCommandError::Save(_) => ExitCode::IoOrParse,
+        CoverCommandError::NoPages => ExitCode::IoOrParse,
     }
 }
 

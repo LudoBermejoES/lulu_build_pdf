@@ -5,7 +5,7 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 ## 1. Shared PDF object access
 
 - [x] 1.1 Add `pdf::effective_page_resources(doc, page_id) -> Result<Dictionary, _>` resolving a page's `/Resources` when direct, when an indirect reference, and when inherited from any `Pages` ancestor, merging child over parent so a page's own entry wins over an inherited one of the same name
-- [ ] 1.2 Route all six current resource reads through it: `normalize::nest_page`, `normalize::split_spread_pages`, `cover::copy_page_as_form`, `cover::extract_panel_as_preview_page`, `ctm_walk::walk_page_images` (including the form's own `/Resources`, which currently falls back to the page's), and `preflight`'s reads
+- [x] 1.2 Route all six current resource reads through it: `normalize::nest_page`, `normalize::split_spread_pages`, `cover::copy_page_as_form`, `cover::extract_panel_as_preview_page`, `ctm_walk::walk_page_images` (including the form's own `/Resources`, which currently falls back to the page's), and `preflight`'s reads
 - [x] 1.3 Make `pdf::rotation_degrees` dereference and accept `Real` as well as `Integer`, round to the nearest 90, and return a distinguishable "present but unreadable" or "not a multiple of 90" outcome instead of `unwrap_or(0)`
 - [x] 1.4 Make `pdf::own_box_rect` / `as_rect_points` dereference both the box entry and each element of the array
 - [x] 1.5 Add a shared accessor for the catalog's `/Names` tree that resolves an indirect reference and supports mutation through the referenced object, and use it in both `preflight::check_structure` and `normalize::sanitize_structure`
@@ -46,7 +46,7 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 - [x] 4.4 Skip or report a degenerate safety inset instead of drawing an inverted rectangle
 - [x] 4.5 Call `geometry::spine_too_narrow_for_text` from the cover path and emit its warning
 - [x] 4.6 Measure supplied cover artwork by its effective (rotation-applied) size, and report a height mismatch as well as a width mismatch
-- [ ] 4.7 Return an error for a supplied cover with no pages instead of `expect`-panicking, and map it to exit 3
+- [x] 4.7 Return an error for a supplied cover with no pages instead of `expect`-panicking, and map it to exit 3
 - [x] 4.8 In `assemble_three_panel_cover`, clip each panel's form to its destination panel rect, align outer panels to the canvas edge rather than centring, and report a panel-size mismatch
 
 ## 5. Lulu API path
