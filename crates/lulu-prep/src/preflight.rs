@@ -2474,4 +2474,60 @@ mod tests {
         // against, so the two can't silently drift apart.
         assert_eq!(crate::geometry::interior_safety_margin().as_inches(), 0.5);
     }
+
+    // --- task 9.5: a /Parent cycle must terminate quickly, not hang. ---
+
+    #[test]
+    fn parent_cycle_fixture_preflights_within_a_generous_bound_instead_of_hanging() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/parent_cycle.pdf");
+        let start = std::time::Instant::now();
+        let report = preflight(FIXTURE, None);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "preflight took {elapsed:?} on a /Parent-cycle fixture; the inheritance walk must be bounded, not hang"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == codes::GEOMETRY_UNREADABLE_PAGE_BOX),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    // --- task 9.6: an indirect /MediaBox that does not resolve must be a
+    // blocking finding naming the page, not a silently skipped page. ---
+
+    #[test]
+    fn mediabox_indirect_unresolved_fixture_is_a_blocking_finding_naming_the_page() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/mediabox_indirect_unresolved.pdf");
+        let report = preflight(FIXTURE, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == codes::GEOMETRY_UNREADABLE_PAGE_BOX)
+            .expect("blocking finding naming the page");
+        assert_eq!(f.severity, Severity::Blocking);
+        assert_eq!(f.pages, vec![1]);
+    }
+
+    // --- task 9.13: a low-resolution image inside a form XObject whose own
+    // /Resources is itself an indirect reference must still be found, with
+    // the correct PPI, composing the form's /Matrix with the page's own cm. ---
+
+    #[test]
+    fn nested_form_indirect_resources_image_fixture_reports_the_correct_ppi() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../tests/fixtures/nested_form_indirect_resources_image.pdf");
+        let report = preflight(FIXTURE, None);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == codes::IMAGE_LOW_RESOLUTION)
+            .expect("low-resolution finding");
+        assert!(f.message.contains("100"), "{}", f.message);
+        assert_eq!(f.pages, vec![1]);
+    }
 }

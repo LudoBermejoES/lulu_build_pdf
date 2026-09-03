@@ -46,6 +46,26 @@ fixture_snapshot_test!(live_transparency, "live_transparency.pdf");
 fixture_snapshot_test!(optional_content_groups, "optional_content_groups.pdf");
 fixture_snapshot_test!(two_up_spread, "two_up_spread.pdf");
 
+// --- harden-pdf-correctness test corpus (tasks.md group 9) ---
+fixture_snapshot_test!(resources_indirect, "resources_indirect.pdf");
+fixture_snapshot_test!(resources_inherited, "resources_inherited.pdf");
+fixture_snapshot_test!(resources_conflicting_key, "resources_conflicting_key.pdf");
+fixture_snapshot_test!(rotate_real_number, "rotate_real_number.pdf");
+fixture_snapshot_test!(rotate_indirect, "rotate_indirect.pdf");
+fixture_snapshot_test!(parent_cycle, "parent_cycle.pdf");
+fixture_snapshot_test!(
+    mediabox_indirect_unresolved,
+    "mediabox_indirect_unresolved.pdf"
+);
+fixture_snapshot_test!(zero_dimension_page, "zero_dimension_page.pdf");
+fixture_snapshot_test!(names_indirect_javascript, "names_indirect_javascript.pdf");
+fixture_snapshot_test!(
+    nested_form_indirect_resources_image,
+    "nested_form_indirect_resources_image.pdf"
+);
+fixture_snapshot_test!(zero_pages, "zero_pages.pdf");
+fixture_snapshot_test!(aliased_page, "aliased_page.pdf");
+
 #[test]
 fn empty_password_encrypted() {
     let bytes = fixture_bytes("encrypted_empty_password.pdf");

@@ -1219,6 +1219,28 @@ mod tests {
         assert!(matches!(err, PageGeometryError::ResourcesUnresolved(id) if id == page_id));
     }
 
+    // --- task 9.2: a page's own resource entry wins over an ancestor's
+    // conflicting entry of the same name, against the committed fixture
+    // (rather than only the in-memory case already covered above by
+    // effective_page_resources_merges_child_over_parent_at_the_sub_dictionary_level). ---
+
+    #[test]
+    fn effective_page_resources_conflicting_key_fixture_page_own_entry_wins() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/resources_conflicting_key.pdf");
+        let doc = load_from_bytes(FIXTURE).expect("load");
+        let page_id = doc.page_iter().next().expect("one page");
+
+        let resources = effective_page_resources(&doc, page_id).unwrap();
+        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        let f1_ref = fonts.get(b"F1").unwrap().as_reference().unwrap();
+        let f1 = doc.get_dictionary(f1_ref).unwrap();
+        assert_eq!(
+            f1.get(b"BaseFont").unwrap().as_name().unwrap(),
+            b"Helvetica",
+            "the page's own /Font /F1 must win over the Pages ancestor's conflicting /F1 (Courier)"
+        );
+    }
+
     // --- rotation_outcome / rotation_degrees (1.3) ---
 
     #[test]
@@ -1567,6 +1589,43 @@ mod tests {
         let _ = deep_copy_object(&mut dest, &src, &Object::Reference(head), &mut memo);
     }
 
+    // --- task 9.12: the same long-chain regression, through the higher-level
+    // copy_page entry point cover assembly and normalization actually call,
+    // not only the lower-level deep_copy_object this module already covers
+    // above. ---
+
+    #[test]
+    fn copy_page_does_not_overflow_the_stack_on_a_long_reference_chain() {
+        let mut src = Document::with_version("1.7");
+        // Hang a 60,000-link chain off a page's own dictionary — the shape
+        // copy_page (used by cover assembly and, transitively, every
+        // normalize_interior run) actually walks, rather than calling
+        // deep_copy_object on the chain directly.
+        let head = build_dictionary_reference_chain(&mut src, 60_000);
+        let pages_id = src.new_object_id();
+        let page_id = src.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => mediabox(0.0, 0.0, 450.0, 666.0),
+            "CustomHostileChain" => Object::Reference(head),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 };
+        src.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = src.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        src.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut dest = Document::with_version("1.7");
+        // Must simply return (truncated past the depth budget, reported as
+        // DeepCopyDepthExceeded) rather than crash.
+        let result = copy_page(&mut dest, &src, page_id);
+        assert!(matches!(
+            result,
+            Err(PageGeometryError::DeepCopyDepthExceeded(id)) if id == page_id
+        ));
+    }
+
     // --- stream filter preservation on decode failure (1.8) ---
 
     #[test]
@@ -1630,6 +1689,77 @@ mod tests {
         };
         assert_eq!(new_stream.content, plain);
         assert!(new_stream.dict.get(b"Filter").is_err());
+    }
+
+    // --- task 9.9: the same DCTDecode preservation, through the
+    // higher-level copy_page entry point (a page whose content actually
+    // draws the image via its /Resources), not only deep_copy_object on the
+    // bare stream above. ---
+
+    #[test]
+    fn copy_page_preserves_a_dctdecode_images_filter_and_bytes() {
+        let mut src = Document::with_version("1.7");
+        let fake_jpeg_bytes =
+            b"\xff\xd8\xff\xe0 not a real jpeg, but undecoded either way".to_vec();
+        let image_id = src.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Filter" => "DCTDecode",
+                "Width" => 300,
+                "Height" => 300,
+                "BitsPerComponent" => 8,
+                "ColorSpace" => "DeviceRGB",
+            },
+            fake_jpeg_bytes.clone(),
+        )));
+        let resources =
+            dictionary! { "XObject" => dictionary! { "Im0" => Object::Reference(image_id) } };
+        let content_id = src.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"q 300 0 0 300 0 0 cm /Im0 Do Q".to_vec(),
+        ));
+        let pages_id = src.new_object_id();
+        let page_id = src.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => mediabox(0.0, 0.0, 450.0, 666.0),
+            "Resources" => resources,
+            "Contents" => Object::Reference(content_id),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 };
+        src.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = src.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        src.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut dest = Document::with_version("1.7");
+        let new_page_id = copy_page(&mut dest, &src, page_id).unwrap();
+
+        let new_page = dest.get_dictionary(new_page_id).unwrap();
+        let new_resources = new_page.get(b"Resources").unwrap().as_dict().unwrap();
+        let new_image_ref = new_resources
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Im0")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let Object::Stream(new_image) = dest.get_object(new_image_ref).unwrap() else {
+            panic!("expected a stream")
+        };
+        assert_eq!(
+            new_image.content, fake_jpeg_bytes,
+            "the still-encoded JPEG bytes must survive the copy unchanged"
+        );
+        assert_eq!(
+            new_image.dict.get(b"Filter").unwrap().as_name().unwrap(),
+            b"DCTDecode",
+            "the Filter must be kept, since the bytes are still encoded under it"
+        );
     }
 
     // --- dangling reference reporting (1.10) ---

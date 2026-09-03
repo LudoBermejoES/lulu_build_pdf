@@ -89,20 +89,20 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 9. Test corpus for the shapes that hid these bugs
 
-- [ ] 9.1 Add fixtures for indirect `/Resources` and inherited `/Resources`, each with content that references a font, asserting the text survives normalization (finding 1)
-- [ ] 9.2 Add a fixture whose page and `Pages` ancestor define the same resource name, asserting the page's own entry wins
-- [ ] 9.3 Add a test asserting `check` and `interior` agree on `unembedded_font.pdf`: both blocking, both exit 1 (finding 2)
-- [ ] 9.4 Add fixtures for `/Rotate` as a real number and as an indirect reference, asserting the effective size and the baked rotation (finding 3)
-- [ ] 9.5 Add a `/Parent` cycle fixture with a bounded-time assertion (finding 4)
-- [ ] 9.6 Add an indirect-`/MediaBox` fixture, asserting a blocking finding rather than a silently skipped page (finding 5)
-- [ ] 9.7 Add a zero-dimension page fixture, asserting refusal and that no `NaN` reaches any output (finding 6)
-- [ ] 9.8 Add a case-wrap template assertion pinning `TrimBox` to the 63 pt inset and the safety guides to a further 54 pt (finding 7)
-- [ ] 9.9 Add a `DCTDecode` image fixture, asserting the filter and bytes survive a deep copy (finding 8)
-- [ ] 9.10 Add a zero-page supplied-cover test asserting a clean error and no panic (finding 10)
-- [ ] 9.11 Add an indirect-`/Names` fixture carrying JavaScript, asserting it is both reported and removed (finding 11)
-- [ ] 9.12 Add a long reference-chain fixture, asserting a finding rather than a stack overflow (finding 19)
-- [ ] 9.13 Add a form-XObject-with-indirect-resources fixture, asserting the correct image is found and its PPI is right (finding 20)
-- [ ] 9.14 Add an aliased-page fixture (one page object in `/Kids` twice), asserting each output page is nested exactly once
+- [x] 9.1 Add fixtures for indirect `/Resources` and inherited `/Resources`, each with content that references a font, asserting the text survives normalization (finding 1)
+- [x] 9.2 Add a fixture whose page and `Pages` ancestor define the same resource name, asserting the page's own entry wins
+- [x] 9.3 Add a test asserting `check` and `interior` agree on `unembedded_font.pdf`: both blocking, both exit 1 (finding 2)
+- [x] 9.4 Add fixtures for `/Rotate` as a real number and as an indirect reference, asserting the effective size and the baked rotation (finding 3)
+- [x] 9.5 Add a `/Parent` cycle fixture with a bounded-time assertion (finding 4)
+- [x] 9.6 Add an indirect-`/MediaBox` fixture, asserting a blocking finding rather than a silently skipped page (finding 5)
+- [x] 9.7 Add a zero-dimension page fixture, asserting refusal and that no `NaN` reaches any output (finding 6)
+- [x] 9.8 Add a case-wrap template assertion pinning `TrimBox` to the 63 pt inset and the safety guides to a further 54 pt (finding 7)
+- [x] 9.9 Add a `DCTDecode` image fixture, asserting the filter and bytes survive a deep copy (finding 8)
+- [x] 9.10 Add a zero-page supplied-cover test asserting a clean error and no panic (finding 10)
+- [x] 9.11 Add an indirect-`/Names` fixture carrying JavaScript, asserting it is both reported and removed (finding 11)
+- [x] 9.12 Add a long reference-chain fixture, asserting a finding rather than a stack overflow (finding 19)
+- [x] 9.13 Add a form-XObject-with-indirect-resources fixture, asserting the correct image is found and its PPI is right (finding 20)
+- [x] 9.14 Add an aliased-page fixture (one page object in `/Kids` twice), asserting each output page is nested exactly once
 - [x] 9.15 Add CLI tests for `book --json` parseability, `--report-out` completeness, the write-failure exit code, invalid config values, and the full-SKU filename
 - [ ] 9.16 Regenerate the affected snapshots and review the diff line by line, treating it as the evidence that the checks now see through nesting rather than blanket-accepting it
-- [ ] 9.17 Extend `examples/generate_fixtures.rs` to build every fixture above, so the corpus stays reproducible from one command
+- [x] 9.17 Extend `examples/generate_fixtures.rs` to build every fixture above, so the corpus stays reproducible from one command

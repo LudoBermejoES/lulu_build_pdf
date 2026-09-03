@@ -986,6 +986,16 @@ pub fn normalize_interior(
     let sanitize_summary = sanitize_structure(&mut doc);
     findings.extend(sanitize_summary_findings(&sanitize_summary));
 
+    // sanitize_structure (and nest_page, earlier in this function) only
+    // unlink what they remove — the JavaScript action, AcroForm fields, and
+    // a source page's now-superseded content/resources all become
+    // unreachable from the trailer rather than being deleted outright.
+    // Pruning here is what actually makes "will be stripped" (this
+    // function's own claim, in sanitize_summary_findings' messages) true at
+    // the byte level, not merely at the reference level — an unreferenced
+    // object is otherwise still present, in full, in the saved file.
+    doc.prune_objects();
+
     let mut output_bytes = Vec::new();
     doc.save_to(&mut output_bytes)?;
 
@@ -2680,6 +2690,163 @@ mod tests {
                 .any(|f| f.code == "normalize.landscape-pages-observed"),
             "{:?}",
             outcome.report.findings
+        );
+    }
+
+    // --- task 9.1: a font behind an indirect, or inherited, /Resources must
+    // survive normalization rather than silently vanishing (the single most
+    // important fixture in the harden-pdf-correctness corpus — see
+    // `openspec/changes/harden-pdf-correctness/proposal.md`'s finding 1). ---
+
+    #[test]
+    fn resources_indirect_fixture_font_survives_normalization() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/resources_indirect.pdf");
+        let outcome =
+            normalize_interior(FIXTURE, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome
+                .report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::RESOURCES_MISSING_REFERENCE),
+            "the font referenced through an indirect /Resources must not vanish: {:?}",
+            outcome.report.findings
+        );
+
+        let reloaded = crate::pdf::load_from_bytes(&outcome.output_bytes).unwrap();
+        let page1 = *reloaded.get_pages().get(&1).unwrap();
+        let (form_dict, form_content) = form_dict_and_content(&reloaded, page1);
+        let resources = form_dict.get(b"Resources").unwrap().as_dict().unwrap();
+        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        assert!(
+            fonts.get(b"F1").is_ok(),
+            "font F1 (behind the page's indirect /Resources) must be present in the nested form's own /Resources"
+        );
+        assert!(String::from_utf8_lossy(&form_content).contains("/F1 24 Tf"));
+    }
+
+    #[test]
+    fn resources_inherited_fixture_font_survives_normalization() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/resources_inherited.pdf");
+        let outcome =
+            normalize_interior(FIXTURE, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome
+                .report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::RESOURCES_MISSING_REFERENCE),
+            "the font inherited from the Pages ancestor must not vanish: {:?}",
+            outcome.report.findings
+        );
+
+        let reloaded = crate::pdf::load_from_bytes(&outcome.output_bytes).unwrap();
+        let page1 = *reloaded.get_pages().get(&1).unwrap();
+        let (form_dict, form_content) = form_dict_and_content(&reloaded, page1);
+        let resources = form_dict.get(b"Resources").unwrap().as_dict().unwrap();
+        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        assert!(
+            fonts.get(b"F1").is_ok(),
+            "font F1 (inherited from the Pages ancestor, absent on the page itself) must be present in the nested form's own /Resources"
+        );
+        assert!(String::from_utf8_lossy(&form_content).contains("/F1 24 Tf"));
+    }
+
+    // --- task 9.4: /Rotate as a real number, or as an indirect reference,
+    // must be read correctly (not silently treated as unrotated) and baked
+    // correctly by normalization. ---
+
+    #[test]
+    fn rotate_real_number_fixture_is_read_and_baked_correctly() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/rotate_real_number.pdf");
+        let doc = crate::pdf::load_from_bytes(FIXTURE).unwrap();
+        let page_id = doc.page_iter().next().unwrap();
+        // Rotate 90.0 (a real number, not the integer 90) swaps the page's
+        // own 450x666 box to an effective 666x450 -- if this were misread
+        // as 0 (the historical bug), effective size would stay 450x666 and
+        // this assertion would fail.
+        let size = crate::pdf::effective_page_size(&doc, page_id).unwrap();
+        assert_eq!(size.width.as_points(), 666.0);
+        assert_eq!(size.height.as_points(), 450.0);
+
+        let outcome =
+            normalize_interior(FIXTURE, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome
+                .report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::GEOMETRY_PAGE_SIZE_MISMATCH),
+            "rotation must be baked in, not left mismatched: {:?}",
+            outcome.report.findings
+        );
+        let reloaded = crate::pdf::load_from_bytes(&outcome.output_bytes).unwrap();
+        let out_page = *reloaded.get_pages().get(&1).unwrap();
+        let out_size = crate::pdf::effective_page_size(&reloaded, out_page).unwrap();
+        assert_eq!(out_size.width.as_points(), 450.0);
+        assert_eq!(out_size.height.as_points(), 666.0);
+    }
+
+    #[test]
+    fn rotate_indirect_fixture_is_read_and_baked_correctly() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/rotate_indirect.pdf");
+        let doc = crate::pdf::load_from_bytes(FIXTURE).unwrap();
+        let page_id = doc.page_iter().next().unwrap();
+        // /Rotate is an indirect reference to the integer 270 here -- if the
+        // reference were not dereferenced (the historical bug), it would
+        // read as unreadable/0 and effective size would stay 450x666.
+        let size = crate::pdf::effective_page_size(&doc, page_id).unwrap();
+        assert_eq!(size.width.as_points(), 666.0);
+        assert_eq!(size.height.as_points(), 450.0);
+
+        let outcome =
+            normalize_interior(FIXTURE, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome
+                .report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::GEOMETRY_PAGE_SIZE_MISMATCH),
+            "rotation must be baked in, not left mismatched: {:?}",
+            outcome.report.findings
+        );
+        let reloaded = crate::pdf::load_from_bytes(&outcome.output_bytes).unwrap();
+        let out_page = *reloaded.get_pages().get(&1).unwrap();
+        let out_size = crate::pdf::effective_page_size(&reloaded, out_page).unwrap();
+        assert_eq!(out_size.width.as_points(), 450.0);
+        assert_eq!(out_size.height.as_points(), 666.0);
+    }
+
+    // --- task 9.11: JavaScript behind an indirect /Names tree must be both
+    // reported by preflight and actually removed by normalize_interior. ---
+
+    #[test]
+    fn names_indirect_javascript_fixture_is_reported_and_removed() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/names_indirect_javascript.pdf");
+        const JS_MARKER: &[u8] = b"LULU_JS_MARKER";
+
+        let check_report = crate::preflight::preflight(FIXTURE, Some(sku_entry()));
+        assert!(
+            check_report
+                .findings
+                .iter()
+                .any(|f| f.code == crate::report::codes::STRUCTURE_JAVASCRIPT),
+            "{:?}",
+            check_report.findings
+        );
+        assert!(
+            FIXTURE.windows(JS_MARKER.len()).any(|w| w == JS_MARKER),
+            "sanity: the fixture must actually carry the marker for this test to mean anything"
+        );
+
+        let outcome =
+            normalize_interior(FIXTURE, sku_entry(), NormalizeOptions::default()).unwrap();
+        assert!(
+            !outcome
+                .output_bytes
+                .windows(JS_MARKER.len())
+                .any(|w| w == JS_MARKER),
+            "the JavaScript action's actual bytes must be gone from normalized output, not merely reported"
         );
     }
 }
