@@ -44,21 +44,63 @@ pub fn now_rfc3339() -> String {
 pub mod codes {
     pub const GEOMETRY_PAGE_SIZE_MISMATCH: &str = "geometry.page-size-mismatch";
     pub const GEOMETRY_MIXED_PAGE_SIZES: &str = "geometry.mixed-page-sizes";
+    /// A page's box (`TrimBox`/`BleedBox`/`CropBox`/`MediaBox`) could not be
+    /// resolved at all — e.g. an indirect reference that does not resolve —
+    /// distinct from [`GEOMETRY_PAGE_SIZE_MISMATCH`], which requires a
+    /// resolvable size that is merely the wrong one.
+    pub const GEOMETRY_UNREADABLE_PAGE_BOX: &str = "geometry.unreadable-page-box";
+    /// A page's `/Rotate` is present but could not be resolved to a number
+    /// at all (e.g. a broken indirect reference or a non-numeric value).
+    pub const GEOMETRY_UNREADABLE_ROTATION: &str = "geometry.unreadable-rotation";
+    /// A page's `/Rotate` resolved to a number, but one that is not (within
+    /// tolerance) a multiple of 90 degrees.
+    pub const GEOMETRY_ROTATION_NOT_MULTIPLE_OF_90: &str = "geometry.rotation-not-multiple-of-90";
+    /// Raster-image content is placed inside Lulu's recommended interior
+    /// safety margin (0.5 in from the trim edge) without bleeding past the
+    /// trim edge itself — content this close to where the page is actually
+    /// cut risks being trimmed off.
+    pub const GEOMETRY_CONTENT_INSIDE_SAFETY_MARGIN: &str = "geometry.content-inside-safety-margin";
     pub const FONTS_NOT_EMBEDDED: &str = "fonts.not-embedded";
     pub const IMAGE_LOW_RESOLUTION: &str = "image.low-resolution";
     pub const IMAGE_EXCESSIVE_RESOLUTION: &str = "image.excessive-resolution";
     pub const COLOUR_TOTAL_AREA_COVERAGE: &str = "colour.total-area-coverage";
     pub const COLOUR_UNSUPPORTED_SPACE: &str = "colour.unsupported-space";
+    /// A tint below Lulu's reproducible minimum — its own code, distinct
+    /// from [`COLOUR_UNSUPPORTED_SPACE`], since "too faint to reproduce" and
+    /// "not a colour space Lulu supports" are unrelated conditions that a
+    /// consumer filtering or suppressing findings by code must be able to
+    /// tell apart.
+    pub const COLOUR_LOW_TINT: &str = "colour.low-tint";
     pub const STRUCTURE_ENCRYPTED: &str = "structure.encrypted";
     pub const STRUCTURE_ANNOTATIONS: &str = "structure.annotations";
     pub const STRUCTURE_SPREAD_LAYOUT: &str = "structure.spread-layout";
+    pub const STRUCTURE_LIVE_TRANSPARENCY: &str = "structure.live-transparency";
+    pub const STRUCTURE_OPTIONAL_CONTENT: &str = "structure.optional-content";
+    pub const STRUCTURE_JAVASCRIPT: &str = "structure.javascript";
+    pub const STRUCTURE_EMBEDDED_FILES: &str = "structure.embedded-files";
+    /// A single walk over a page's content and nested form XObjects
+    /// exhausted `ctm_walk`'s total-operation budget before finishing —
+    /// whatever a check already saw is genuine, but the walk (and therefore
+    /// that check) is incomplete for this page.
+    pub const STRUCTURE_TRAVERSAL_BUDGET_EXCEEDED: &str = "structure.traversal-budget-exceeded";
     pub const PAGE_COUNT_BELOW_MINIMUM: &str = "page-count.below-minimum";
     pub const PAGE_COUNT_ABOVE_MAXIMUM: &str = "page-count.above-maximum";
     pub const PAGE_COUNT_NOT_DIVISIBLE: &str = "page-count.not-divisible";
     pub const GUTTER_BELOW_ADVISORY_FLOOR: &str = "gutter.below-advisory-floor";
+    /// A page's own effective `/Resources` (its own, or one inherited from a
+    /// `Pages` ancestor) is a reference that does not resolve to a
+    /// dictionary — the one code both normalization (which refuses to
+    /// transform such a page) and preflight (which flags it directly) use
+    /// for this condition, so the two can never disagree about its name.
     pub const GEOMETRY_UNRESOLVABLE_RESOURCES: &str = "geometry.unresolvable-resources";
     pub const GEOMETRY_DEGENERATE: &str = "geometry.degenerate";
     pub const GUTTER_EXCEEDS_SAFE_AREA: &str = "gutter.exceeds-safe-area";
+    /// A page or form XObject's content stream names a resource (font,
+    /// XObject, `ExtGState`, colour space, pattern, or shading) that cannot
+    /// be found in its effective resources.
+    pub const RESOURCES_MISSING_REFERENCE: &str = "resources.missing-reference";
+    pub const DOCUMENT_PARSE_FAILED: &str = "document.parse-failed";
+    pub const COVER_WRONG_PAGE_COUNT: &str = "cover.wrong-page-count";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

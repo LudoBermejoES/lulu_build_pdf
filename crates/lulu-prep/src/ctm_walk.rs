@@ -1,9 +1,19 @@
 //! A read-only walk of a page's content stream, tracking the current
 //! transformation matrix (CTM) through `cm`/`q`/`Q` and descending into form
 //! XObjects, so callers can learn where on the page each image XObject is
-//! actually drawn. Confined to preflight: a bug here degrades a warning, it
-//! never corrupts output, since nothing here writes to the document.
+//! actually drawn — and, via [`LayerVisitor`]/[`collect_page_layers`], what
+//! resources and content every nested form carries, so a font, colour
+//! operator, or resource reference set only inside a form is visible to a
+//! caller exactly as if it were on the page itself. Confined to preflight: a
+//! bug here degrades a finding, it never corrupts output, since nothing here
+//! writes to the document.
+//!
+//! Both entry points share one traversal (`walk`, below) rather than two
+//! that could disagree about which forms exist or how deep they nest — see
+//! `design.md`'s "Preflight gains a form-XObject-aware mode rather than a
+//! second implementation".
 
+use crate::pdf::effective_page_resources;
 use crate::units::Matrix;
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -43,9 +53,90 @@ impl<F: FnMut(Matrix, &Dictionary, ObjectId)> ImageVisitor for F {
     }
 }
 
+/// Called once for the page's own content stream (`form_id: None`), and once
+/// more for every form XObject the page draws — directly, or transitively
+/// through another form — up to the same depth and operation budget as image
+/// discovery. Given the resources and (already-decoded) content bytes in
+/// effect for that layer.
+///
+/// This is what lets preflight's font-embedding, colour, and resource-name
+/// checks see through nesting: they implement this trait once and get the
+/// page's own content plus every nested form's, from a single walk, rather
+/// than needing their own descent into form XObjects.
+pub trait LayerVisitor {
+    fn visit_layer(&mut self, resources: &Dictionary, content: &[u8], form_id: Option<ObjectId>);
+}
+
+impl<F: FnMut(&Dictionary, &[u8], Option<ObjectId>)> LayerVisitor for F {
+    fn visit_layer(&mut self, resources: &Dictionary, content: &[u8], form_id: Option<ObjectId>) {
+        self(resources, content, form_id)
+    }
+}
+
 /// Maximum form-XObject recursion depth, guarding against a (malformed or
 /// adversarial) form that references itself.
 const MAX_FORM_DEPTH: u32 = 32;
+
+/// Maximum total content-stream operations (summed across the page's own
+/// content and every nested form, at every depth) a single walk will
+/// examine before giving up. `MAX_FORM_DEPTH` alone bounds recursion depth
+/// but not total work: a file with N levels of forms, each invoking two more
+/// forms, is 2^N walks from a handful of bytes, which is a CPU-exhaustion
+/// risk from a small, legally-shaped input.
+///
+/// 300,000 is chosen to be generous for any real book while still bounding
+/// that adversarial case: a heavily illustrated interior plausibly reaches a
+/// few hundred operations per page for vector art plus one `Do` per image,
+/// so a walk covering even a 1,000+ page interior in a single pass (this
+/// crate walks one page's tree at a time, so in practice the operative
+/// bound is per-page, not per-document) stays well under this ceiling,
+/// while an adversarial file trying to multiply a small input into billions
+/// of apparent operations hits the budget almost immediately relative to
+/// its claimed structure. Tune this in light of what a large real-world
+/// fixture in the test corpus actually needs once one exists (see
+/// `openspec/changes/harden-pdf-correctness/tasks.md` group 9).
+pub const MAX_WALK_OPERATIONS: usize = 300_000;
+
+/// How a walk over a page's content and nested form XObjects finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkOutcome {
+    /// Every reachable form XObject (bounded by [`MAX_FORM_DEPTH`]) was
+    /// examined without exhausting [`MAX_WALK_OPERATIONS`].
+    Completed,
+    /// The walk stopped early because it examined
+    /// [`MAX_WALK_OPERATIONS`] content-stream operations without finishing —
+    /// the file's nested form XObjects are large or deep enough that
+    /// finishing would risk denial-of-service. Whatever a visitor already
+    /// saw is genuine, but the walk is incomplete: a caller MUST treat this
+    /// as a blocking finding ("checks are incomplete"), never as a silent
+    /// truncation that a clean report could follow.
+    BudgetExceeded,
+}
+
+/// One examined content stream and its effective resources: either a page's
+/// own content and resources (`form_id: None`), or one form XObject it draws
+/// — directly, or transitively through another form (`form_id: Some`, the
+/// form's own object id). Owned, so a caller can run several checks (font
+/// embedding, colour, resource-name resolution) against the same walk
+/// without invoking [`collect_page_layers`] once per check.
+#[derive(Debug, Clone)]
+pub struct ContentLayer {
+    pub resources: Dictionary,
+    pub content: Vec<u8>,
+    pub form_id: Option<ObjectId>,
+}
+
+/// `object`, dereferenced one level if it is an [`Object::Reference`], as a
+/// dictionary — used for a form XObject's own `/Resources`, which (like a
+/// page's) is legally either a direct dictionary or an indirect reference to
+/// one.
+fn resolve_dict<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Dictionary> {
+    match object {
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        Object::Dictionary(d) => Some(d),
+        _ => None,
+    }
+}
 
 fn xobject_dict<'a>(
     doc: &'a Document,
@@ -68,27 +159,73 @@ fn xobject_dict<'a>(
     Some((dict, object_ref))
 }
 
+/// Shared, mutable state threaded through every recursive [`walk`] call: the
+/// document being walked (read-only), and the remaining operation budget —
+/// see [`MAX_WALK_OPERATIONS`].
+struct WalkCtx<'a> {
+    doc: &'a Document,
+    budget: usize,
+    exceeded: bool,
+}
+
+/// Explicit, fresh reborrow of an `Option<&mut dyn ImageVisitor>` — written
+/// out by hand rather than via `Option::as_deref_mut`, because that generic
+/// combinator (going through `DerefMut`'s associated type) does not give the
+/// borrow checker a short-enough-lived reborrow across a loop's iterations
+/// or into a recursive call in this shape, and reports a spurious "borrowed
+/// more than once" error. A plain function reborrowing manually does not
+/// have that limitation.
+fn reborrow_image<'s>(
+    visitor: &'s mut Option<&mut dyn ImageVisitor>,
+) -> Option<&'s mut dyn ImageVisitor> {
+    match visitor {
+        Some(v) => Some(&mut **v),
+        None => None,
+    }
+}
+
+/// [`reborrow_image`]'s counterpart for [`LayerVisitor`].
+fn reborrow_layer<'s>(
+    visitor: &'s mut Option<&mut dyn LayerVisitor>,
+) -> Option<&'s mut dyn LayerVisitor> {
+    match visitor {
+        Some(v) => Some(&mut **v),
+        None => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk(
-    doc: &Document,
+    ctx: &mut WalkCtx,
     content_bytes: &[u8],
-    resources: Option<&Dictionary>,
+    resources: &Dictionary,
     ctm: Matrix,
     depth: u32,
-    visitor: &mut dyn ImageVisitor,
+    form_id: Option<ObjectId>,
+    mut image_visitor: Option<&mut dyn ImageVisitor>,
+    mut layer_visitor: Option<&mut dyn LayerVisitor>,
 ) {
-    if depth > MAX_FORM_DEPTH {
+    if depth > MAX_FORM_DEPTH || ctx.exceeded {
         return;
     }
     let Ok(content) = Content::decode(content_bytes) else {
         return;
     };
-    let Some(resources) = resources else { return };
+
+    if let Some(lv) = reborrow_layer(&mut layer_visitor) {
+        lv.visit_layer(resources, content_bytes, form_id);
+    }
 
     let mut stack: Vec<Matrix> = Vec::new();
     let mut current = ctm;
 
     for Operation { operator, operands } in content.operations.iter() {
+        if ctx.budget == 0 {
+            ctx.exceeded = true;
+            return;
+        }
+        ctx.budget -= 1;
+
         match operator.as_str() {
             "q" => stack.push(current),
             "Q" => {
@@ -105,12 +242,16 @@ fn walk(
                 let Some(Object::Name(name)) = operands.first() else {
                     continue;
                 };
-                let Some((xdict, xid)) = xobject_dict(doc, resources, name) else {
+                let Some((xdict, xid)) = xobject_dict(ctx.doc, resources, name) else {
                     continue;
                 };
                 let subtype = xdict.get(b"Subtype").and_then(|o| o.as_name()).ok();
                 match subtype {
-                    Some(b"Image") => visitor.visit_image(current, xdict, xid),
+                    Some(b"Image") => {
+                        if let Some(iv) = reborrow_image(&mut image_visitor) {
+                            iv.visit_image(current, xdict, xid);
+                        }
+                    }
                     Some(b"Form") => {
                         let form_matrix = xdict
                             .get(b"Matrix")
@@ -119,14 +260,32 @@ fn walk(
                             .and_then(|arr| matrix_from_cm_operands(arr))
                             .unwrap_or(Matrix::IDENTITY);
                         let form_ctm = form_matrix.then(current);
+                        // A form with no /Resources of its own uses the
+                        // resources in effect where it is invoked (the
+                        // page's, or an enclosing form's) — PDF spec,
+                        // "Form Dictionaries". Resolved through one level of
+                        // indirection either way, since /Resources is
+                        // legally a direct dict or a reference to one.
                         let form_resources = xdict
                             .get(b"Resources")
                             .ok()
-                            .and_then(|o| o.as_dict().ok())
-                            .or(Some(resources));
-                        if let Ok(Object::Stream(stream)) = doc.get_object(xid) {
+                            .and_then(|o| resolve_dict(ctx.doc, o))
+                            .unwrap_or(resources);
+                        if let Ok(Object::Stream(stream)) = ctx.doc.get_object(xid) {
                             if let Ok(bytes) = stream.get_plain_content() {
-                                walk(doc, &bytes, form_resources, form_ctm, depth + 1, visitor);
+                                walk(
+                                    ctx,
+                                    &bytes,
+                                    form_resources,
+                                    form_ctm,
+                                    depth + 1,
+                                    Some(xid),
+                                    reborrow_image(&mut image_visitor),
+                                    reborrow_layer(&mut layer_visitor),
+                                );
+                                if ctx.exceeded {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -138,12 +297,88 @@ fn walk(
     }
 }
 
+/// Core entry point both public functions below delegate to, parameterized
+/// on the operation budget so tests can exercise [`WalkOutcome::BudgetExceeded`]
+/// without generating a multi-hundred-thousand-operation fixture.
+fn run_walk(
+    doc: &Document,
+    page_id: ObjectId,
+    budget: usize,
+    image_visitor: Option<&mut dyn ImageVisitor>,
+    layer_visitor: Option<&mut dyn LayerVisitor>,
+) -> WalkOutcome {
+    // A page whose effective resources can't be resolved at all (a broken
+    // /Resources reference) is a distinct defect that a caller needing to
+    // report it should detect directly via `pdf::effective_page_resources`
+    // — there is nothing for a content walk to see in that case, so this
+    // just walks nothing rather than guessing at a fallback.
+    let Ok(resources) = effective_page_resources(doc, page_id) else {
+        return WalkOutcome::Completed;
+    };
+    let content_bytes = doc.get_page_content(page_id);
+    let mut ctx = WalkCtx {
+        doc,
+        budget,
+        exceeded: false,
+    };
+    walk(
+        &mut ctx,
+        &content_bytes,
+        &resources,
+        Matrix::IDENTITY,
+        0,
+        None,
+        image_visitor,
+        layer_visitor,
+    );
+    if ctx.exceeded {
+        WalkOutcome::BudgetExceeded
+    } else {
+        WalkOutcome::Completed
+    }
+}
+
 /// Walk a page's content stream (and any form XObjects it invokes), calling
 /// `visitor` for every image `Do` with the CTM at that draw site.
-pub fn walk_page_images(doc: &Document, page_id: ObjectId, visitor: &mut dyn ImageVisitor) {
-    let content_bytes = doc.get_page_content(page_id);
-    let resources = doc.get_page_resources(page_id).ok().and_then(|(r, _)| r);
-    walk(doc, &content_bytes, resources, Matrix::IDENTITY, 0, visitor);
+pub fn walk_page_images(
+    doc: &Document,
+    page_id: ObjectId,
+    visitor: &mut dyn ImageVisitor,
+) -> WalkOutcome {
+    run_walk(doc, page_id, MAX_WALK_OPERATIONS, Some(visitor), None)
+}
+
+struct LayerCollector {
+    layers: Vec<ContentLayer>,
+}
+
+impl LayerVisitor for LayerCollector {
+    fn visit_layer(&mut self, resources: &Dictionary, content: &[u8], form_id: Option<ObjectId>) {
+        self.layers.push(ContentLayer {
+            resources: resources.clone(),
+            content: content.to_vec(),
+            form_id,
+        });
+    }
+}
+
+/// Collects every [`ContentLayer`] for a page — its own, plus every form
+/// XObject it draws to whatever depth and operation budget the walk allows
+/// — in one pass. This is the traversal preflight's font-embedding, colour,
+/// and resource-name checks share, so a font or colour operator set only
+/// inside a nested form XObject is examined exactly as if it were on the
+/// page itself, and all three checks agree on what "the page's content"
+/// means.
+pub fn collect_page_layers(doc: &Document, page_id: ObjectId) -> (Vec<ContentLayer>, WalkOutcome) {
+    let mut collector = LayerCollector { layers: Vec::new() };
+    let outcome = run_walk(
+        doc,
+        page_id,
+        MAX_WALK_OPERATIONS,
+        None,
+        Some(&mut collector),
+    );
+    (collector.layers, outcome)
 }
 
 /// The length, in points, of the two edges of the unit square as transformed
@@ -324,5 +559,158 @@ mod tests {
         // Just needs to terminate; no images to find.
         assert_eq!(count, 0);
         let _ = Length::ZERO; // silence unused-import in case of future edits
+    }
+
+    #[test]
+    fn indirect_page_resources_are_resolved() {
+        // /Resources on the page written as an indirect reference — the
+        // shape that `effective_page_resources` exists to handle, and that
+        // `doc.get_page_resources` alone used to silently drop.
+        let mut doc = Document::with_version("1.7");
+        let image_id = doc.add_object(Object::Stream(Stream::new(
+            image_xobject(300, 300),
+            vec![0u8; 4],
+        )));
+        let resources_id = doc.add_object(Object::Dictionary(
+            dictionary! { "XObject" => dictionary! { "Im0" => Object::Reference(image_id) } },
+        ));
+        let pages_id = doc.new_object_id();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"/Im0 Do".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 450.into(), 666.into()]),
+            "Resources" => Object::Reference(resources_id),
+            "Contents" => Object::Reference(content_id),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut count = 0;
+        let outcome = walk_page_images(&doc, page_id, &mut |_: Matrix, _: &Dictionary, _id| {
+            count += 1
+        });
+        assert_eq!(count, 1);
+        assert_eq!(outcome, WalkOutcome::Completed);
+    }
+
+    #[test]
+    fn indirect_form_resources_are_resolved() {
+        // The form's own /Resources written as an indirect reference — the
+        // shape task 1.2 calls out as still falling back to the page's
+        // resources instead of resolving the indirection.
+        let (doc, page_id) = doc_with_page_content(b"/Fm0 Do", |doc| {
+            let image_id = doc.add_object(Object::Stream(Stream::new(
+                image_xobject(300, 300),
+                vec![0u8; 4],
+            )));
+            let form_resources_id = doc.add_object(Object::Dictionary(
+                dictionary! { "XObject" => dictionary! { "Im0" => Object::Reference(image_id) } },
+            ));
+            let form_id = doc.add_object(Object::Stream(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "Resources" => Object::Reference(form_resources_id),
+                },
+                b"/Im0 Do".to_vec(),
+            )));
+            dictionary! { "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) } }
+        });
+
+        let mut count = 0;
+        walk_page_images(&doc, page_id, &mut |_: Matrix, _: &Dictionary, _id| {
+            count += 1
+        });
+        assert_eq!(
+            count, 1,
+            "an image findable only through the form's indirect /Resources must be found"
+        );
+    }
+
+    #[test]
+    fn collect_page_layers_sees_the_page_and_every_nested_form() {
+        let (doc, page_id) = doc_with_page_content(b"BT /F1 12 Tf ET /Fm0 Do", |doc| {
+            let form_content = b"BT /F2 12 Tf ET";
+            let form_resources = dictionary! { "Font" => dictionary! { "F2" => Object::Reference(doc.new_object_id()) } };
+            let form_id = doc.add_object(Object::Stream(Stream::new(
+                dictionary! { "Type" => "XObject", "Subtype" => "Form", "Resources" => form_resources },
+                form_content.to_vec(),
+            )));
+            dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(doc.new_object_id()) },
+                "XObject" => dictionary! { "Fm0" => Object::Reference(form_id) },
+            }
+        });
+
+        let (layers, outcome) = collect_page_layers(&doc, page_id);
+        assert_eq!(outcome, WalkOutcome::Completed);
+        assert_eq!(layers.len(), 2, "the page's own layer plus one form layer");
+
+        let page_layer = layers
+            .iter()
+            .find(|l| l.form_id.is_none())
+            .expect("page layer");
+        assert!(page_layer.content.starts_with(b"BT /F1"));
+        assert!(page_layer.resources.get(b"Font").is_ok());
+
+        let form_layer = layers
+            .iter()
+            .find(|l| l.form_id.is_some())
+            .expect("form layer");
+        assert!(form_layer.content.starts_with(b"BT /F2"));
+        assert!(form_layer
+            .resources
+            .get(b"Font")
+            .and_then(|o| o.as_dict())
+            .unwrap()
+            .get(b"F2")
+            .is_ok());
+    }
+
+    #[test]
+    fn operation_budget_exceeded_is_reported_not_silently_truncated() {
+        // A tiny budget of 3 operations against a content stream with far
+        // more than that must stop early and report BudgetExceeded, rather
+        // than silently examining only the first 3 and calling it done.
+        let (doc, page_id) =
+            doc_with_page_content(b"q Q q Q q Q q Q q Q q Q q Q", |_| dictionary! {});
+        let outcome = run_walk(&doc, page_id, 3, None, None);
+        assert_eq!(outcome, WalkOutcome::BudgetExceeded);
+    }
+
+    #[test]
+    fn operation_budget_not_exceeded_when_content_fits() {
+        let (doc, page_id) = doc_with_page_content(b"q Q", |_| dictionary! {});
+        let outcome = run_walk(&doc, page_id, 1000, None, None);
+        assert_eq!(outcome, WalkOutcome::Completed);
+    }
+
+    #[test]
+    fn budget_is_shared_across_nested_forms_not_reset_per_form() {
+        // Each form burns 2 operations (q Q); with a budget of 3, the first
+        // form's own two operations plus one more from the second form's
+        // entry must exhaust it — proving the budget is a single, walk-wide
+        // total rather than being reset at each recursion level.
+        let (doc, page_id) = doc_with_page_content(b"/Fm0 Do /Fm1 Do", |doc| {
+            let fm0 = doc.add_object(Object::Stream(Stream::new(
+                dictionary! { "Type" => "XObject", "Subtype" => "Form" },
+                b"q Q".to_vec(),
+            )));
+            let fm1 = doc.add_object(Object::Stream(Stream::new(
+                dictionary! { "Type" => "XObject", "Subtype" => "Form" },
+                b"q Q".to_vec(),
+            )));
+            dictionary! { "XObject" => dictionary! { "Fm0" => Object::Reference(fm0), "Fm1" => Object::Reference(fm1) } }
+        });
+        // Top-level content "/Fm0 Do /Fm1 Do" is itself 2 operations; budget
+        // of 3 must run out partway through, well short of completing both
+        // forms plus both Do calls.
+        let outcome = run_walk(&doc, page_id, 3, None, None);
+        assert_eq!(outcome, WalkOutcome::BudgetExceeded);
     }
 }
