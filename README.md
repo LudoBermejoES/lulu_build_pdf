@@ -67,7 +67,11 @@ lulu-prep book manuscript.pdf --sku 0600X0900.BW.STD.PB.060UW444.MXX --output-di
 `book` normalizes the interior first, then builds the cover from the
 *normalized* interior's final page count (after any blank-page padding) —
 never from the page count you started with, so the pair can never drift out
-of sync.
+of sync. Its `--json` output is a single document, `{"interior": {...},
+"cover": {...}}`, rather than the interior's and cover's reports printed one
+after another — the whole point is that it's one parseable thing, and
+`--report-out` writes it once rather than being overwritten by the second of
+two separate writes.
 
 ## Product selection
 
@@ -92,11 +96,12 @@ required (trim + bleed) canvas:
   the bleed area, cropping equally on all sides. Use when the source has no
   bleed and a small uniform crop is acceptable; never distorts, but you lose
   a fixed margin all around.
-- **`stretch-margins`** — like `center`, but fills the surrounding bleed area
-  with a flat colour instead of leaving it blank. A simplified stand-in for
-  Lulu's "extend the outermost edge pixels or fill colour" allowance — true
-  edge extension would require decoding and resampling raster content, which
-  this tool does not do.
+- **`stretch-margins`** — documented as filling the surrounding bleed area
+  with a flat colour, as a stand-in for Lulu's "extend the outermost edge
+  pixels or fill colour" allowance. **Not implemented**: selecting it fails
+  the run explicitly rather than silently behaving like `center`. True edge
+  extension would require decoding and resampling raster content, which this
+  tool does not do; a flat-colour fill remains open for a future change.
 
 ## Optional stages
 
@@ -157,3 +162,12 @@ four reasons on a file this tool reported as print-ready, that is a bug in
 this tool — please turn the offending file into a new test fixture
 (`crates/lulu-prep/examples/generate_fixtures.rs`) rather than working around
 it by hand next time.
+
+`check` and `interior` are guaranteed to agree about the same input: if
+`check` reports a blocking finding, `interior` on that same file will too
+(and exit 1), never silently produce a `print-ready` file that still carries
+the problem. In particular, font embedding and colour/ink checks now see
+through the form XObjects normalization nests page content into, so an
+unembedded font or a colour problem inside already-normalized content is
+still caught rather than becoming invisible to the checks that exist to
+catch it.
