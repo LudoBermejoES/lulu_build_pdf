@@ -128,43 +128,95 @@ impl DetectionOutcome {
     }
 }
 
-/// Runs `cmd`, killing it if it hasn't exited within `timeout`. Reads
-/// stdout/stderr manually after confirming exit via `try_wait` — calling
-/// `wait_with_output` after an explicit `try_wait` that already observed
-/// exit would double-reap the child on some platforms, so this avoids that
-/// by never calling `wait()` a second time.
-fn run_with_timeout(
+/// Why [`run_with_timeout_bytes`] did not return a captured status/output.
+#[derive(Debug)]
+enum RunError {
+    /// The command could not even be started (binary missing, not
+    /// executable, permission denied, ...) — or an OS-level error occurred
+    /// while polling it, which is rare enough to fold into the same "this
+    /// child is unusable" bucket rather than growing a third variant.
+    Unusable(std::io::Error),
+    /// The child was still running after `timeout` and was killed.
+    Timeout { elapsed: Duration },
+}
+
+/// Runs `cmd`, killing it if it hasn't exited within `timeout`. Stdout and
+/// stderr are each drained by a dedicated reader thread for the child's
+/// entire lifetime, started immediately after spawn and joined only after
+/// the child has exited (or been killed) — reading only *after* `try_wait`
+/// observes exit, as an earlier version of this function did, deadlocks
+/// against a child that writes more than one OS pipe buffer's worth of
+/// output (typically 64KB) before exiting, since the child blocks on its
+/// own `write()` while nothing is reading the other end.
+fn run_with_timeout_bytes(
     cmd: &mut Command,
     timeout: Duration,
-) -> Option<(std::process::ExitStatus, String, String)> {
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), RunError> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(RunError::Unusable)?;
     let start = Instant::now();
+
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let status = loop {
-        match child.try_wait().ok()? {
-            Some(status) => break status,
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(RunError::Timeout {
+                        elapsed: start.elapsed(),
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
+            Err(e) => return Err(RunError::Unusable(e)),
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-    Some((status, stdout, stderr))
+
+    // The child has exited (or was killed above, which closes its ends of
+    // the pipes), so each reader thread's `read_to_end` will return; join
+    // rather than detach so no output is lost to a thread still catching up.
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    Ok((status, stdout, stderr))
+}
+
+/// String-oriented convenience wrapper over [`run_with_timeout_bytes`], for
+/// callers (the capability-detection probe) whose output is expected to be
+/// text. Invalid UTF-8 is replaced lossily rather than discarding whatever
+/// was captured.
+fn run_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), RunError> {
+    let (status, stdout, stderr) = run_with_timeout_bytes(cmd, timeout)?;
+    Ok((
+        status,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
 }
 
 /// Detects one external tool: resolved from `configured_path` if given
@@ -189,7 +241,7 @@ pub fn detect(
         return DetectionOutcome::NotFound;
     }
 
-    let Some((status, stdout, stderr)) =
+    let Ok((status, stdout, stderr)) =
         run_with_timeout(Command::new(&resolved).arg(spec.version_arg), timeout)
     else {
         return DetectionOutcome::Unresponsive;
@@ -239,6 +291,8 @@ pub enum RepairError {
     RepairFailed { stderr: String },
     #[error("qpdf exited successfully but produced no output")]
     NoOutput,
+    #[error("qpdf did not finish repairing this file within {elapsed:?} and was terminated")]
+    Timeout { elapsed: Duration },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -253,10 +307,17 @@ pub struct QpdfRepairOptions {
 /// `infile` does not support stdin ("reading from stdin is not supported",
 /// per `qpdf --help=usage`), only `outfile` may be `-` for stdout, so the
 /// input is written to a temporary file first.
+///
+/// `timeout` bounds the qpdf invocation itself (not the temp-file setup):
+/// a qpdf process that hangs on hostile input is killed and reported as
+/// [`RepairError::Timeout`] rather than left to run forever. The temporary
+/// input file is always cleaned up on return, timeout included, since it is
+/// a [`tempfile::NamedTempFile`] deleted on drop.
 pub fn repair_with_qpdf(
     qpdf_path: &Path,
     input_bytes: &[u8],
     options: QpdfRepairOptions,
+    timeout: Duration,
 ) -> Result<Vec<u8>, RepairError> {
     let mut input_file = tempfile::Builder::new()
         .suffix(".pdf")
@@ -279,74 +340,94 @@ pub fn repair_with_qpdf(
         cmd.arg("--linearize");
     }
     cmd.arg(input_file.path()).arg("-");
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = cmd
-        .output()
-        .map_err(|e| RepairError::ToolUnavailable(e.to_string()))?;
-    if !output.status.success() {
+    let (status, stdout, stderr) = match run_with_timeout_bytes(&mut cmd, timeout) {
+        Ok(v) => v,
+        Err(RunError::Timeout { elapsed }) => return Err(RepairError::Timeout { elapsed }),
+        Err(RunError::Unusable(e)) => return Err(RepairError::ToolUnavailable(e.to_string())),
+    };
+    if !status.success() {
         return Err(RepairError::RepairFailed {
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
         });
     }
-    if output.stdout.is_empty() {
+    if stdout.is_empty() {
         return Err(RepairError::NoOutput);
     }
-    Ok(output.stdout)
+    Ok(stdout)
 }
 
-/// Loads a PDF, automatically attempting qpdf repair (when `qpdf_path` is
-/// given) if native parsing fails, then re-parsing the repaired bytes.
-/// Returns whether repair was used, for the run report. When native
-/// parsing fails and no qpdf path is given, the original parse error is
-/// returned — the caller (preflight) turns that into a blocking finding
-/// naming qpdf as the remedy, per [`RepairError`]'s absence here meaning
-/// "repair was never attempted."
+/// Why loading a PDF failed when qpdf repair was in play — as opposed to
+/// [`crate::pdf::LoadError`] alone, this distinguishes "native parsing
+/// failed and repair was never attempted" (no `qpdf_path` was supplied)
+/// from "native parsing failed, qpdf repair was attempted, and it also
+/// failed" — the latter carries qpdf's own diagnostics rather than
+/// discarding them in favour of the original parse error.
+#[derive(Debug, thiserror::Error)]
+pub enum RepairOrLoadError {
+    #[error(transparent)]
+    ParseFailed(#[from] crate::pdf::LoadError),
+    #[error("could not parse this file ({native_err}); repairing it with qpdf was attempted and also failed: {qpdf_diagnostics}")]
+    RepairAttemptedAndFailed {
+        native_err: String,
+        qpdf_diagnostics: String,
+    },
+}
+
+/// Loads bytes as a PDF, attempting qpdf repair (when `qpdf_path` is given)
+/// if native parsing fails, then re-parsing the repaired bytes rather than
+/// bytes reused from the pipeline that produced this function's bytes-only
+/// sibling, [`repair_bytes_if_needed`], which this delegates to — the two
+/// callers just want a different final shape (a parsed [`lopdf::Document`]
+/// here; raw bytes there, for a caller about to do its own parsing).
 pub fn load_with_optional_repair(
     bytes: &[u8],
     qpdf_path: Option<&Path>,
-) -> Result<(lopdf::Document, bool), crate::pdf::LoadError> {
-    match crate::pdf::load_from_bytes(bytes) {
-        Ok(doc) => Ok((doc, false)),
-        Err(native_err) => {
-            let Some(qpdf_path) = qpdf_path else {
-                return Err(native_err);
-            };
-            let Ok(repaired) = repair_with_qpdf(qpdf_path, bytes, QpdfRepairOptions::default())
-            else {
-                return Err(native_err);
-            };
-            let doc = crate::pdf::load_from_bytes(&repaired)?;
-            Ok((doc, true))
-        }
-    }
+    timeout: Duration,
+) -> Result<(lopdf::Document, bool), RepairOrLoadError> {
+    let (bytes, was_repaired) = repair_bytes_if_needed(bytes, qpdf_path, timeout)?;
+    let doc = crate::pdf::load_from_bytes(&bytes)?;
+    Ok((doc, was_repaired))
 }
 
-/// Same decision as [`load_with_optional_repair`], but returns bytes rather
-/// than a parsed [`lopdf::Document`] — for a caller (the pipeline) that is
-/// about to hand the bytes to another function which does its own parsing,
-/// such as [`crate::normalize::normalize_interior`].
+/// Loads bytes as a PDF only far enough to decide whether they need qpdf
+/// repair (when `qpdf_path` is given) before handing them onward, returning
+/// bytes rather than a parsed [`lopdf::Document`] — for a caller (the
+/// pipeline) that is about to hand the bytes to another function which does
+/// its own parsing, such as [`crate::normalize::normalize_interior`]. When
+/// native parsing fails and no qpdf path is given, the original parse error
+/// is returned — the caller (preflight) turns that into a blocking finding
+/// naming qpdf as the remedy. `timeout` is passed through to
+/// [`repair_with_qpdf`].
 pub fn repair_bytes_if_needed(
     bytes: &[u8],
     qpdf_path: Option<&Path>,
-) -> Result<(Vec<u8>, bool), crate::pdf::LoadError> {
-    match crate::pdf::load_from_bytes(bytes) {
-        Ok(_) => Ok((bytes.to_vec(), false)),
-        Err(native_err) => {
-            let Some(qpdf_path) = qpdf_path else {
-                return Err(native_err);
-            };
-            let Ok(repaired) = repair_with_qpdf(qpdf_path, bytes, QpdfRepairOptions::default())
-            else {
-                return Err(native_err);
-            };
-            // Confirm the repair actually produced something lopdf can read
-            // before handing it onward — a caller downstream re-parsing
-            // silently-still-broken bytes would fail more confusingly there.
-            crate::pdf::load_from_bytes(&repaired).map_err(|_| native_err)?;
-            Ok((repaired, true))
-        }
+    timeout: Duration,
+) -> Result<(Vec<u8>, bool), RepairOrLoadError> {
+    let native_err = match crate::pdf::load_from_bytes(bytes) {
+        Ok(_) => return Ok((bytes.to_vec(), false)),
+        Err(e) => e,
+    };
+    let Some(qpdf_path) = qpdf_path else {
+        return Err(RepairOrLoadError::ParseFailed(native_err));
+    };
+    let repaired = repair_with_qpdf(qpdf_path, bytes, QpdfRepairOptions::default(), timeout)
+        .map_err(|repair_err| RepairOrLoadError::RepairAttemptedAndFailed {
+            native_err: native_err.to_string(),
+            qpdf_diagnostics: repair_err.to_string(),
+        })?;
+    // Confirm the repair actually produced something lopdf can read before
+    // handing it onward — a caller downstream re-parsing silently-still-
+    // broken bytes would fail more confusingly there.
+    if let Err(reparse_err) = crate::pdf::load_from_bytes(&repaired) {
+        return Err(RepairOrLoadError::RepairAttemptedAndFailed {
+            native_err: native_err.to_string(),
+            qpdf_diagnostics: format!(
+                "qpdf exited successfully but its output still does not parse: {reparse_err}"
+            ),
+        });
     }
+    Ok((repaired, true))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +456,8 @@ pub enum GhostscriptError {
     NoOutput,
     #[error("Ghostscript's output geometry does not match the input: {0}")]
     GeometryChanged(String),
+    #[error("Ghostscript did not finish within {elapsed:?} and was terminated")]
+    Timeout { elapsed: Duration },
 }
 
 /// Builds the Ghostscript argument list for the flatten/colour-convert
@@ -422,10 +505,18 @@ fn build_ghostscript_args(
 /// can never leave a partial or corrupt file at a path the caller cares
 /// about: the caller only persists the returned bytes after `Ok`, and
 /// nothing is written anywhere on `Err`.
+///
+/// `timeout` bounds the Ghostscript invocation: a process that hangs on
+/// hostile input is killed and reported as [`GhostscriptError::Timeout`]
+/// rather than left to run forever. Both temporary files are cleaned up on
+/// return, timeout included, since they are [`tempfile::NamedTempFile`]s
+/// deleted on drop — so a timeout leaves the pre-stage bytes the caller
+/// already has untouched and no partial output file behind.
 pub fn flatten_with_ghostscript(
     gs_path: &Path,
     input_bytes: &[u8],
     options: &GhostscriptFlattenOptions,
+    timeout: Duration,
 ) -> Result<(Vec<u8>, Vec<String>), GhostscriptError> {
     let mut input_file = tempfile::Builder::new()
         .suffix(".pdf")
@@ -443,13 +534,16 @@ pub fn flatten_with_ghostscript(
         .map_err(|e| GhostscriptError::ToolUnavailable(e.to_string()))?;
 
     let args = build_ghostscript_args(input_file.path(), output_file.path(), options)?;
-    let output = Command::new(gs_path)
-        .args(&args)
-        .output()
-        .map_err(|e| GhostscriptError::ToolUnavailable(e.to_string()))?;
-    if !output.status.success() {
+    let mut cmd = Command::new(gs_path);
+    cmd.args(&args);
+    let (status, _stdout, stderr) = match run_with_timeout_bytes(&mut cmd, timeout) {
+        Ok(v) => v,
+        Err(RunError::Timeout { elapsed }) => return Err(GhostscriptError::Timeout { elapsed }),
+        Err(RunError::Unusable(e)) => return Err(GhostscriptError::ToolUnavailable(e.to_string())),
+    };
+    if !status.success() {
         return Err(GhostscriptError::Failed {
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
         });
     }
     let bytes = std::fs::read(output_file.path()).map_err(|_| GhostscriptError::NoOutput)?;
@@ -457,6 +551,29 @@ pub fn flatten_with_ghostscript(
         return Err(GhostscriptError::NoOutput);
     }
     Ok((bytes, args))
+}
+
+/// Reads a PDF rectangle array (`[x0 y0 x1 y1]`) as exactly four numbers,
+/// dereferencing each element against `doc` in case it is an indirect
+/// reference. Returns `None` — "unreadable", never "nothing to compare" —
+/// if the array does not have exactly four elements, or if any element
+/// does not dereference to an `Integer` or `Real`. A caller comparing two
+/// boxes must treat `None` on either side as a failure: a box array whose
+/// elements are all unresolvable indirect references produces zero parsed
+/// numbers on both sides under a naive `filter_map`, and `0 == 0` with
+/// `.all()` over an empty iterator is vacuously `true` — which is exactly
+/// the "compared nothing, called it a match" bug this type exists to rule
+/// out at the type level.
+fn box_as_four_numbers(doc: &lopdf::Document, arr: &[lopdf::Object]) -> Option<[f64; 4]> {
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0f64; 4];
+    for (i, obj) in arr.iter().enumerate() {
+        let (_, resolved) = doc.dereference(obj).ok()?;
+        out[i] = resolved.as_float().ok()? as f64;
+    }
+    Some(out)
 }
 
 /// Confirms the Ghostscript stage didn't alter what normalization already
@@ -497,24 +614,27 @@ pub fn assert_geometry_preserved(
                 .and_then(|o| o.as_array().ok());
             match (before_box, after_box) {
                 (Some(b), Some(a)) => {
-                    let bv: Vec<f64> = b
-                        .iter()
-                        .filter_map(|o| o.as_float().ok())
-                        .map(|v| v as f64)
-                        .collect();
-                    let av: Vec<f64> = a
-                        .iter()
-                        .filter_map(|o| o.as_float().ok())
-                        .map(|v| v as f64)
-                        .collect();
-                    let matches = bv.len() == av.len()
-                        && bv.iter().zip(av.iter()).all(|(x, y)| (x - y).abs() < 0.01);
-                    if !matches {
-                        return Err(GhostscriptError::GeometryChanged(format!(
-                            "page {}'s {} changed: {bv:?} -> {av:?}",
-                            page_number + 1,
-                            String::from_utf8_lossy(box_key)
-                        )));
+                    let bv = box_as_four_numbers(before, b);
+                    let av = box_as_four_numbers(after, a);
+                    match (bv, av) {
+                        (Some(bv), Some(av)) => {
+                            let matches =
+                                bv.iter().zip(av.iter()).all(|(x, y)| (x - y).abs() < 0.01);
+                            if !matches {
+                                return Err(GhostscriptError::GeometryChanged(format!(
+                                    "page {}'s {} changed: {bv:?} -> {av:?}",
+                                    page_number + 1,
+                                    String::from_utf8_lossy(box_key)
+                                )));
+                            }
+                        }
+                        _ => {
+                            return Err(GhostscriptError::GeometryChanged(format!(
+                                "page {}'s {} could not be read as four numbers on both sides ({bv:?} -> {av:?})",
+                                page_number + 1,
+                                String::from_utf8_lossy(box_key)
+                            )));
+                        }
                     }
                 }
                 (None, None) => {}
@@ -535,6 +655,10 @@ pub fn assert_geometry_preserved(
 mod tests {
     use super::*;
     use lopdf::dictionary;
+
+    /// A generous bound for tests that expect a real tool invocation to
+    /// succeed promptly — not the timeout under test.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
     fn version_parses_common_formats() {
@@ -759,8 +883,13 @@ mod tests {
             "fixture must actually be broken for lopdf"
         );
 
-        let repaired = repair_with_qpdf(&qpdf_path, &broken, QpdfRepairOptions::default())
-            .expect("qpdf repair");
+        let repaired = repair_with_qpdf(
+            &qpdf_path,
+            &broken,
+            QpdfRepairOptions::default(),
+            TEST_TIMEOUT,
+        )
+        .expect("qpdf repair");
         let doc = crate::pdf::load_from_bytes(&repaired).expect("repaired file must parse");
         assert_eq!(doc.get_pages().len(), 1);
     }
@@ -772,7 +901,7 @@ mod tests {
         };
         let broken = pdf_with_broken_startxref();
 
-        let (doc, repaired) = load_with_optional_repair(&broken, Some(&qpdf_path))
+        let (doc, repaired) = load_with_optional_repair(&broken, Some(&qpdf_path), TEST_TIMEOUT)
             .expect("should recover via repair");
         assert!(repaired);
         assert_eq!(doc.get_pages().len(), 1);
@@ -784,8 +913,8 @@ mod tests {
             return;
         };
         let broken = pdf_with_broken_startxref();
-        let (bytes, repaired) =
-            repair_bytes_if_needed(&broken, Some(&qpdf_path)).expect("should recover via repair");
+        let (bytes, repaired) = repair_bytes_if_needed(&broken, Some(&qpdf_path), TEST_TIMEOUT)
+            .expect("should recover via repair");
         assert!(repaired);
         let doc = crate::pdf::load_from_bytes(&bytes).expect("repaired bytes must parse");
         assert_eq!(doc.get_pages().len(), 1);
@@ -794,7 +923,7 @@ mod tests {
     #[test]
     fn repair_bytes_if_needed_passes_through_a_healthy_file_unchanged() {
         let good = minimal_valid_pdf();
-        let (bytes, repaired) = repair_bytes_if_needed(&good, None).unwrap();
+        let (bytes, repaired) = repair_bytes_if_needed(&good, None, TEST_TIMEOUT).unwrap();
         assert!(!repaired);
         assert_eq!(bytes, good);
     }
@@ -802,7 +931,8 @@ mod tests {
     #[test]
     fn load_with_optional_repair_passes_through_a_healthy_file_unrepaired() {
         let good = minimal_valid_pdf();
-        let (doc, repaired) = load_with_optional_repair(&good, None).expect("healthy file loads");
+        let (doc, repaired) =
+            load_with_optional_repair(&good, None, TEST_TIMEOUT).expect("healthy file loads");
         assert!(!repaired);
         assert_eq!(doc.get_pages().len(), 1);
     }
@@ -810,9 +940,12 @@ mod tests {
     #[test]
     fn load_with_optional_repair_without_qpdf_surfaces_the_original_parse_error() {
         let broken = pdf_with_broken_startxref();
-        let err = load_with_optional_repair(&broken, None).unwrap_err();
-        // Just needs to be the native parse error, not a panic or a silent empty document.
-        let _ = err;
+        let err = load_with_optional_repair(&broken, None, TEST_TIMEOUT).unwrap_err();
+        assert!(
+            matches!(err, RepairOrLoadError::ParseFailed(_)),
+            "repair was never attempted (no qpdf_path given), so the error must say so, not \
+             claim a repair attempt that never happened: {err}"
+        );
     }
 
     #[test]
@@ -822,9 +955,154 @@ mod tests {
             Path::new("/definitely/not/a/real/qpdf/binary"),
             &broken,
             QpdfRepairOptions::default(),
+            TEST_TIMEOUT,
         )
         .unwrap_err();
         assert!(matches!(err, RepairError::ToolUnavailable(_)));
+    }
+
+    #[test]
+    fn a_failed_repair_reports_qpdf_own_diagnostics_not_just_the_original_error() {
+        // Not a PDF at all — native parsing fails, and qpdf's own repair
+        // attempt fails too (there is no xref to reconstruct: "unable to
+        // find trailer dictionary while recovering damaged file"), so the
+        // caller must see qpdf's own diagnostic, not a bare suggestion to
+        // "try qpdf" for a tool that already ran and already explained why
+        // it couldn't help.
+        let Some(qpdf_path) = qpdf_path_or_skip() else {
+            return;
+        };
+        let garbage = b"this is not a PDF file at all, just some plain bytes".to_vec();
+        assert!(
+            crate::pdf::load_from_bytes(&garbage).is_err(),
+            "fixture must actually fail native parsing"
+        );
+
+        let err = repair_bytes_if_needed(&garbage, Some(&qpdf_path), TEST_TIMEOUT).unwrap_err();
+        match err {
+            RepairOrLoadError::RepairAttemptedAndFailed {
+                qpdf_diagnostics, ..
+            } => {
+                assert!(
+                    !qpdf_diagnostics.trim().is_empty(),
+                    "must carry qpdf's own diagnostics, not an empty string"
+                );
+            }
+            other => panic!(
+                "expected RepairAttemptedAndFailed carrying qpdf's own diagnostics, got: {other}"
+            ),
+        }
+    }
+
+    // --- bounded timeout and concurrent draining (repair_with_qpdf) ---
+
+    /// Writes an executable shell script standing in for a "tool" that
+    /// ignores whatever arguments it's called with, for exercising
+    /// [`run_with_timeout_bytes`] without depending on real qpdf/Ghostscript
+    /// behaviour.
+    #[cfg(unix)]
+    fn fake_shell_tool(script_body: &str) -> tempfile::TempPath {
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = tempfile::Builder::new()
+            .prefix("fake-tool-")
+            .tempfile()
+            .expect("create fake tool script");
+        file.write_all(format!("#!/bin/sh\n{script_body}\n").as_bytes())
+            .expect("write fake tool script");
+        file.flush().expect("flush fake tool script");
+        let path = file.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake tool script executable");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_repair_times_out_rather_than_hanging_forever() {
+        let script = fake_shell_tool("sleep 5");
+        let broken = pdf_with_broken_startxref();
+        let start = Instant::now();
+        let err = repair_with_qpdf(
+            &script,
+            &broken,
+            QpdfRepairOptions::default(),
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not wait for the full sleep duration"
+        );
+        assert!(matches!(err, RepairError::Timeout { .. }), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_repair_captures_output_larger_than_a_pipe_buffer_without_deadlock() {
+        // Writes 200KB to stdout — well past a typical 64KB OS pipe buffer —
+        // and exits successfully. With the old "read only after try_wait
+        // observes exit" approach this would deadlock: the child blocks on
+        // its own `write()` once the pipe fills, and the parent's loop only
+        // calls `try_wait`, never reads, so the child never gets to exit.
+        let script = fake_shell_tool("head -c 200000 /dev/zero");
+        let broken = pdf_with_broken_startxref();
+        let start = Instant::now();
+        let repaired =
+            repair_with_qpdf(&script, &broken, QpdfRepairOptions::default(), TEST_TIMEOUT)
+                .expect("large output must not deadlock the read");
+        assert_eq!(repaired.len(), 200_000);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "draining concurrently must not be slow: {:?}",
+            start.elapsed()
+        );
+    }
+
+    // --- bounded timeout and concurrent draining (flatten_with_ghostscript) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn ghostscript_flatten_times_out_rather_than_hanging_forever() {
+        let script = fake_shell_tool("sleep 5");
+        let start = Instant::now();
+        let err = flatten_with_ghostscript(
+            &script,
+            b"whatever",
+            &GhostscriptFlattenOptions::default(),
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not wait for the full sleep duration"
+        );
+        assert!(matches!(err, GhostscriptError::Timeout { .. }), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghostscript_flatten_captures_large_stderr_without_deadlock() {
+        // Writes 200KB of diagnostics to stderr and exits non-zero — the
+        // same deadlock risk as the qpdf stdout case above, on the other
+        // pipe.
+        let script = fake_shell_tool("head -c 200000 /dev/zero 1>&2; exit 1");
+        let start = Instant::now();
+        let err = flatten_with_ghostscript(
+            &script,
+            b"whatever",
+            &GhostscriptFlattenOptions::default(),
+            TEST_TIMEOUT,
+        )
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "draining concurrently must not be slow: {:?}",
+            start.elapsed()
+        );
+        match err {
+            GhostscriptError::Failed { stderr } => assert_eq!(stderr.len(), 200_000),
+            other => panic!("expected Failed with the full stderr captured, got: {other}"),
+        }
     }
 
     // --- Ghostscript argument construction ---
@@ -873,6 +1151,7 @@ mod tests {
             Path::new("/definitely/not/a/real/gs/binary"),
             b"whatever",
             &GhostscriptFlattenOptions::default(),
+            TEST_TIMEOUT,
         )
         .unwrap_err();
         assert!(matches!(err, GhostscriptError::ToolUnavailable(_)));
@@ -955,5 +1234,92 @@ mod tests {
         let before = doc_with_page_box(450.0, 666.0);
         let after = doc_with_page_box(450.001, 666.0);
         assert!(assert_geometry_preserved(&before, &after).is_ok());
+    }
+
+    /// A document whose page's `MediaBox` is four elements, each of which is
+    /// an indirect reference to an object that either resolves to a number
+    /// (`resolvable = true`) or points nowhere at all (`resolvable =
+    /// false`, the broken-indirect-element case this test module exists to
+    /// catch).
+    fn doc_with_indirect_media_box(width: f64, height: f64, resolvable: bool) -> lopdf::Document {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let coords = [0.0, 0.0, width, height];
+        let media_box: Vec<lopdf::Object> = coords
+            .iter()
+            .map(|&v| {
+                if resolvable {
+                    lopdf::Object::Reference(doc.add_object(lopdf::Object::Real(v as f32)))
+                } else {
+                    // A reference to an object ID never inserted anywhere
+                    // in this document — dereferencing it fails, the same
+                    // shape as a box element a lenient viewer might guess
+                    // at but this tool must not.
+                    lopdf::Object::Reference((9999, 0))
+                }
+            })
+            .collect();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => lopdf::Object::Reference(pages_id),
+            "MediaBox" => lopdf::Object::Array(media_box),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![lopdf::Object::Reference(page_id)], "Count" => 1 };
+        doc.objects
+            .insert(pages_id, lopdf::Object::Dictionary(pages));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => lopdf::Object::Reference(pages_id) },
+        );
+        doc.trailer
+            .set("Root", lopdf::Object::Reference(catalog_id));
+        doc
+    }
+
+    #[test]
+    fn indirect_box_elements_that_resolve_are_compared_correctly() {
+        let before = doc_with_indirect_media_box(450.0, 666.0, true);
+        let after = doc_with_indirect_media_box(450.0, 666.0, true);
+        assert!(assert_geometry_preserved(&before, &after).is_ok());
+    }
+
+    #[test]
+    fn vacuous_empty_box_comparison_is_rejected() {
+        // Both sides' MediaBox is four indirect references that resolve to
+        // nothing. The old comparison built each side's numbers with
+        // `.filter_map(|o| o.as_float().ok())`: every element fails to
+        // parse (it's a `Reference`, not a number, and was never
+        // dereferenced), so both sides collect to an empty `Vec<f64>`,
+        // `0 == 0` holds, and `.all()` over an empty iterator is vacuously
+        // `true` — the check passed having compared nothing. It must fail
+        // instead, even when — especially when — both sides look identical
+        // because both are equally unreadable.
+        let doc = doc_with_indirect_media_box(450.0, 666.0, false);
+        let err = assert_geometry_preserved(&doc, &doc).unwrap_err();
+        assert!(matches!(err, GhostscriptError::GeometryChanged(_)), "{err}");
+    }
+
+    #[test]
+    fn a_box_array_with_the_wrong_number_of_elements_is_rejected() {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => lopdf::Object::Reference(pages_id),
+            // Five numbers, not four — malformed, but must be caught
+            // rather than silently zipped against a well-formed box.
+            "MediaBox" => lopdf::Object::Array(vec![0.0.into(), 0.0.into(), 450.0.into(), 666.0.into(), 1.0.into()]),
+        });
+        let pages = dictionary! { "Type" => "Pages", "Kids" => vec![lopdf::Object::Reference(page_id)], "Count" => 1 };
+        doc.objects
+            .insert(pages_id, lopdf::Object::Dictionary(pages));
+        let catalog_id = doc.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => lopdf::Object::Reference(pages_id) },
+        );
+        doc.trailer
+            .set("Root", lopdf::Object::Reference(catalog_id));
+
+        let well_formed = doc_with_page_box(450.0, 666.0);
+        let err = assert_geometry_preserved(&doc, &well_formed).unwrap_err();
+        assert!(matches!(err, GhostscriptError::GeometryChanged(_)), "{err}");
     }
 }

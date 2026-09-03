@@ -123,11 +123,16 @@ fn plain_content_and_filter(
 
 /// Converts every eligible `DeviceRGB` image in the document to
 /// `dest_space` using `dest_profile`, in place. Eligible means 8 bits per
-/// component and either no filter or a plain `FlateDecode` filter
-/// (re-applied on the output); anything else — JPEG/DCTDecode, JPX,
-/// indexed colour, 16-bit samples — is left untouched and reported as
-/// skipped, never failed. Returns one [`ImageConversionOutcome`] per image
-/// found, in document order.
+/// component and either no filter or a plain `FlateDecode` filter;
+/// anything else — JPEG/DCTDecode, JPX, indexed colour, 16-bit samples —
+/// is left untouched and reported as skipped, never failed. The converted
+/// image is written as raw, uncompressed samples with its `/Filter`
+/// removed rather than re-applied — this can make a converted image
+/// substantially larger than its original, since nothing recompresses it
+/// here; `/Decode`, `/SMask`, and `/ImageMask` are also left as found on
+/// the (now wrong colour space) image dictionary rather than reconciled.
+/// Returns one [`ImageConversionOutcome`] per image found, in document
+/// order.
 ///
 /// `dest_space` is exposed (rather than hardcoding CMYK) so the mechanism
 /// can be exercised in tests against destination profiles lcms2 can build
