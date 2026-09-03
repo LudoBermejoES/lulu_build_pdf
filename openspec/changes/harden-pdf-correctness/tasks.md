@@ -51,9 +51,9 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 5. Lulu API path
 
-- [ ] 5.1 Make `hardcover_geometry_via_api` refuse `LinenWrap`, returning `HardcoverGeometryUnavailable`, so the API path cannot reintroduce the dust-jacket guess `cover.rs` refuses to make
-- [ ] 5.2 Route the binding-to-spine-rule decision through one shared function used by both `cover_geometry` and the API path
-- [ ] 5.3 Return an error rather than `Length::ZERO` for an unexpected `SpineWidth` in the API path
+- [x] 5.1 Make `hardcover_geometry_via_api` refuse `LinenWrap`, returning `HardcoverGeometryUnavailable`, so the API path cannot reintroduce the dust-jacket guess `cover.rs` refuses to make
+- [x] 5.2 Route the binding-to-spine-rule decision through one shared function used by both `cover_geometry` and the API path
+- [x] 5.3 Return an error rather than `Length::ZERO` for an unexpected `SpineWidth` in the API path
 
 ## 6. External tools and pipeline
 

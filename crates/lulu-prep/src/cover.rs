@@ -124,7 +124,12 @@ fn perfect_geometry(
 /// boundary rather than a formula error. See the `hardcover_case_wrap_*`
 /// tests below for the exact recorded values. This is Lulu-confirmed, not
 /// locally inferred — case wrap no longer needs [`HARDCOVER_TEMPLATE_TABLE`].
-const CASE_WRAP_OVERHANG_IN: f64 = 0.875;
+///
+/// `pub(crate)` so [`crate::lulu_api::hardcover_geometry_via_api`] can derive
+/// the same trim rect from Lulu's own supplied canvas that this module
+/// derives from its own computed one, rather than the two paths each
+/// carrying their own copy of the overhang.
+pub(crate) const CASE_WRAP_OVERHANG_IN: f64 = 0.875;
 
 fn case_wrap_geometry(
     entry: &CatalogEntry,
@@ -289,6 +294,49 @@ fn hardcover_geometry_from_table(
     })
 }
 
+/// Which panel-layout rule a binding's cover follows — the single answer to
+/// "does this binding get a spine, and how is its geometry built" that both
+/// [`cover_geometry`] (this module's fully local path) and
+/// [`crate::lulu_api::hardcover_geometry_via_api`] (which builds geometry
+/// from Lulu's own authoritative `cover-dimensions` canvas rather than one
+/// this crate computed) read, so the two paths cannot independently disagree
+/// about which bindings are supported.
+///
+/// This does not itself say *where the canvas comes from* — [`cover_geometry`]
+/// computes its own for [`BindingPanelModel::Perfect`] and
+/// [`BindingPanelModel::CaseWrap`] and falls back to the (currently empty)
+/// [`HARDCOVER_TEMPLATE_TABLE`] for [`BindingPanelModel::UnsupportedDustJacket`],
+/// while the API path always starts from Lulu's supplied canvas — only which
+/// *panel layout* applies once a canvas exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingPanelModel {
+    /// A flat back/spine/front wrap using the perfect-bound spine formula —
+    /// or, for saddle stitch, coil, and Wire-O, the same layout with a
+    /// zero-width spine ([`crate::geometry::SpineWidth::None`]), since none
+    /// of those bindings have a printable spine at all.
+    Perfect,
+    /// A three-panel back/spine/front layout with
+    /// [`crate::geometry::SpineWidth::Hardcover`] centred in the canvas —
+    /// true of case wrap's canvas, whether that canvas was computed locally
+    /// ([`case_wrap_geometry`]) or supplied by Lulu's API.
+    CaseWrap,
+    /// A dust jacket (linen wrap): front and back *flaps*, not a three-panel
+    /// layout this crate models — refused rather than guessed, even given an
+    /// authoritative canvas (see [`HARDCOVER_TEMPLATE_TABLE`]'s doc comment).
+    UnsupportedDustJacket,
+}
+
+/// The single place that decides [`BindingPanelModel`] for a [`Binding`].
+pub(crate) fn binding_panel_model(binding: Binding) -> BindingPanelModel {
+    match binding {
+        Binding::Perfect | Binding::SaddleStitch | Binding::Coil | Binding::WireO => {
+            BindingPanelModel::Perfect
+        }
+        Binding::CaseWrap => BindingPanelModel::CaseWrap,
+        Binding::LinenWrap => BindingPanelModel::UnsupportedDustJacket,
+    }
+}
+
 /// Cover geometry for `entry` at its *final* interior page count (after
 /// normalization padding). Refuses a page count that doesn't satisfy the
 /// product's own rules, naming the next valid one.
@@ -297,17 +345,14 @@ pub fn cover_geometry(
     page_count: u32,
 ) -> Result<CoverGeometry, CoverGeometryError> {
     require_conformant_count(entry, page_count)?;
-    match entry.binding {
-        Binding::Perfect => perfect_geometry(entry, page_count),
-        Binding::CaseWrap => case_wrap_geometry(entry, page_count),
-        Binding::LinenWrap => hardcover_geometry(entry, page_count),
-        Binding::SaddleStitch | Binding::Coil | Binding::WireO => {
-            // These bindings have no spine (crate::geometry::SpineWidth::None);
-            // the caller shouldn't be requesting wrap-cover geometry for one,
-            // but treat it the same as a perfect-bound flat cover (spine width 0)
-            // rather than panicking on an unexpected binding.
-            perfect_geometry(entry, page_count)
-        }
+    match binding_panel_model(entry.binding) {
+        // Saddle stitch, coil, and Wire-O have no spine
+        // (crate::geometry::SpineWidth::None); perfect_geometry treats that
+        // the same as a perfect-bound flat cover (spine width 0) rather than
+        // panicking on an unexpected binding.
+        BindingPanelModel::Perfect => perfect_geometry(entry, page_count),
+        BindingPanelModel::CaseWrap => case_wrap_geometry(entry, page_count),
+        BindingPanelModel::UnsupportedDustJacket => hardcover_geometry(entry, page_count),
     }
 }
 

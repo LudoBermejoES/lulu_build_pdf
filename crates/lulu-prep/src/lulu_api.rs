@@ -497,14 +497,36 @@ pub enum HardcoverApiError {
     NonNumericDimension(&'static str),
     #[error("this product's spine width could not be computed: {0}")]
     Spine(#[from] crate::geometry::SpineError),
+    /// Covers both "this binding has no three-panel layout this crate
+    /// models" (linen wrap's dust jacket) and "this binding's spine width
+    /// formula didn't produce a hardcover spine at all" — either way, this
+    /// API path refuses rather than building a guessed or spineless
+    /// geometry. Reuses [`crate::cover::CoverGeometryError`] rather than a
+    /// separate variant, since it is the exact refusal the local path
+    /// ([`crate::cover::cover_geometry`]) already makes for the same
+    /// binding.
+    #[error(transparent)]
+    Geometry(#[from] crate::cover::CoverGeometryError),
 }
 
-/// Builds hardcover (case wrap / linen wrap) cover geometry from Lulu's live
-/// `cover-dimensions` endpoint, for a product and page count absent from the
-/// local template table ([`crate::cover::cover_geometry`] refuses those
-/// rather than guessing). The canvas comes from Lulu; fold positions are
+/// Builds hardcover cover geometry from Lulu's live `cover-dimensions`
+/// endpoint, for a product and page count absent from the local template
+/// table ([`crate::cover::cover_geometry`] refuses those rather than
+/// guessing). Only case wrap's canvas is a simple back/spine/front
+/// three-panel layout ([`crate::cover::BindingPanelModel::CaseWrap`], the
+/// same decision [`crate::cover::cover_geometry`] reads); a linen-wrap dust
+/// jacket has front/back flaps instead, so this refuses it — with
+/// [`crate::cover::CoverGeometryError::HardcoverGeometryUnavailable`], not
+/// centred three-panel geometry built from Lulu's canvas — exactly as the
+/// local path already does, and any other binding this crate has no spine
+/// rule for is refused the same way rather than treated as spineless.
+///
+/// For a supported binding: the canvas comes from Lulu; fold positions are
 /// derived by centring the published hardcover spine width formula within
-/// it, and the hinge is Lulu's documented 0.25 in constant.
+/// it; the hinge is Lulu's documented 0.25 in constant; and the trim rect is
+/// derived from case wrap's own board-overhang convention
+/// ([`crate::cover::CASE_WRAP_OVERHANG_IN`]), the same one
+/// `crate::cover::case_wrap_geometry` uses for a locally computed canvas.
 pub async fn hardcover_geometry_via_api(
     client: &reqwest::Client,
     env: Environment,
@@ -512,6 +534,13 @@ pub async fn hardcover_geometry_via_api(
     entry: &crate::catalog::CatalogEntry,
     page_count: u32,
 ) -> Result<crate::cover::CoverGeometry, HardcoverApiError> {
+    if crate::cover::binding_panel_model(entry.binding) != crate::cover::BindingPanelModel::CaseWrap
+    {
+        return Err(HardcoverApiError::Geometry(
+            crate::cover::CoverGeometryError::HardcoverGeometryUnavailable { page_count },
+        ));
+    }
+
     let dims = cover_dimensions(client, env, token, &entry.sku, page_count, "pt").await?;
     let width: f64 = dims
         .width
@@ -531,12 +560,23 @@ pub async fn hardcover_geometry_via_api(
     let spine = crate::geometry::spine_width(entry.binding, page_count, entry.interior_ppi)?;
     let spine_width = match spine {
         crate::geometry::SpineWidth::Hardcover(w) => w,
-        _ => crate::units::Length::ZERO,
+        // Unreachable in production: binding_panel_model has already
+        // limited entry.binding to CaseWrap above, and spine_width always
+        // answers Hardcover(_) or an Err for that binding. Kept as an error
+        // rather than a silent `Length::ZERO` fallback so a future change to
+        // either dispatch table cannot quietly reintroduce a spineless
+        // three-panel cover.
+        crate::geometry::SpineWidth::Perfect(_) | crate::geometry::SpineWidth::None => {
+            return Err(HardcoverApiError::Geometry(
+                crate::cover::CoverGeometryError::HardcoverGeometryUnavailable { page_count },
+            ));
+        }
     };
     let fold1 = (canvas.width - spine_width) / 2.0;
     let fold2 = fold1 + spine_width;
     let hinge = crate::units::Length::from_inches(0.25);
     let zero = crate::units::Length::ZERO;
+    let overhang = crate::units::Length::from_inches(crate::cover::CASE_WRAP_OVERHANG_IN);
 
     Ok(crate::cover::CoverGeometry {
         canvas,
@@ -575,6 +615,7 @@ pub async fn hardcover_geometry_via_api(
             },
         )),
         page_count,
+        trim_rect: crate::units::Rect::from_origin_size(canvas).inset(overhang),
     })
 }
 
@@ -1134,6 +1175,108 @@ mod tests {
                 - geo.canvas.width.as_points()
                 < 1e-6
         );
+    }
+
+    #[tokio::test]
+    async fn hardcover_geometry_via_api_refuses_linen_wrap_even_with_an_authoritative_canvas() {
+        // A linen-wrap dust jacket has front/back flaps, not the simple
+        // three-panel layout this crate models; even though Lulu's API
+        // returns a real canvas here, the API path must refuse to centre a
+        // spine in it exactly as the local path (cover::cover_geometry)
+        // does, rather than reintroducing the guess.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cover-dimensions/"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({ "width": "1458.0", "height": "702.0", "unit": "pt" }),
+            ))
+            .mount(&server)
+            .await;
+
+        let entry = crate::catalog::search(|e| e.binding == crate::catalog::Binding::LinenWrap)
+            .first()
+            .copied()
+            .expect("a linen wrap product");
+        let client = reqwest::Client::new();
+        let env = Environment::Custom(server.uri());
+        let token = AccessToken("t".to_string());
+
+        let err = hardcover_geometry_via_api(&client, env, &token, entry, 100)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HardcoverApiError::Geometry(
+                    crate::cover::CoverGeometryError::HardcoverGeometryUnavailable {
+                        page_count: 100
+                    }
+                )
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardcover_geometry_via_api_refuses_an_unsupported_binding_rather_than_going_spineless()
+    {
+        // A binding with no spine rule at all (e.g. perfect-bound) must be
+        // an error naming the binding, never a silent spineless three-panel
+        // geometry (the old `_ => Length::ZERO` fallback).
+        let server = MockServer::start().await;
+        // No /cover-dimensions/ mock is registered: if this ever made the
+        // network call before refusing, this test would fail on the
+        // unmocked request rather than passing for the wrong reason.
+
+        let entry = crate::catalog::search(|e| e.binding == crate::catalog::Binding::Perfect)
+            .first()
+            .copied()
+            .expect("a perfect-bound product");
+        let client = reqwest::Client::new();
+        let env = Environment::Custom(server.uri());
+        let token = AccessToken("t".to_string());
+
+        let err = hardcover_geometry_via_api(&client, env, &token, entry, 100)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HardcoverApiError::Geometry(
+                    crate::cover::CoverGeometryError::HardcoverGeometryUnavailable { .. }
+                )
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardcover_geometry_via_api_computes_trim_rect_from_the_case_wrap_overhang() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cover-dimensions/"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({ "width": "936.0", "height": "684.0", "unit": "pt" }),
+            ))
+            .mount(&server)
+            .await;
+
+        let entry = crate::catalog::search(|e| e.binding == crate::catalog::Binding::CaseWrap)
+            .first()
+            .copied()
+            .expect("a case wrap product");
+        let client = reqwest::Client::new();
+        let env = Environment::Custom(server.uri());
+        let token = AccessToken("t".to_string());
+
+        let geo = hardcover_geometry_via_api(&client, env, &token, entry, 210)
+            .await
+            .unwrap();
+        let overhang = crate::units::Length::from_inches(crate::cover::CASE_WRAP_OVERHANG_IN);
+        assert_eq!(geo.trim_rect.x0, overhang);
+        assert_eq!(geo.trim_rect.y0, overhang);
+        assert_eq!(geo.trim_rect.x1, geo.canvas.width - overhang);
+        assert_eq!(geo.trim_rect.y1, geo.canvas.height - overhang);
     }
 
     #[tokio::test]
