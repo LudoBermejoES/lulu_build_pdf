@@ -57,13 +57,13 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 6. External tools and pipeline
 
-- [ ] 6.1 Apply a timeout to `repair_with_qpdf` and `flatten_with_ghostscript`, which currently use `Command::output()` unbounded
-- [ ] 6.2 Drain child stdout/stderr concurrently with execution in the shared runner, so a chatty child cannot deadlock
-- [ ] 6.3 Report qpdf's own diagnostics when repair was attempted and failed, instead of discarding them for the original parse error
-- [ ] 6.4 Record in the report that the input was repaired, replacing `let _ = was_repaired`
-- [ ] 6.5 Re-preflight the final bytes after the Ghostscript stage so the reported verdict describes the file actually written
-- [ ] 6.6 Make `assert_geometry_preserved` compare four numbers per box explicitly and fail when either side is unreadable, rather than passing vacuously on two empty vectors
-- [ ] 6.7 Collapse `load_with_optional_repair` and `repair_bytes_if_needed` so one delegates to the other
+- [x] 6.1 Apply a timeout to `repair_with_qpdf` and `flatten_with_ghostscript`, which currently use `Command::output()` unbounded
+- [x] 6.2 Drain child stdout/stderr concurrently with execution in the shared runner, so a chatty child cannot deadlock
+- [x] 6.3 Report qpdf's own diagnostics when repair was attempted and failed, instead of discarding them for the original parse error
+- [x] 6.4 Record in the report that the input was repaired, replacing `let _ = was_repaired`
+- [x] 6.5 Re-preflight the final bytes after the Ghostscript stage so the reported verdict describes the file actually written
+- [x] 6.6 Make `assert_geometry_preserved` compare four numbers per box explicitly and fail when either side is unreadable, rather than passing vacuously on two empty vectors
+- [x] 6.7 Collapse `load_with_optional_repair` and `repair_bytes_if_needed` so one delegates to the other
 
 ## 7. CLI contracts
 
@@ -80,8 +80,8 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 8. Documentation and consistency
 
-- [ ] 8.1 Fix `pipeline.rs`'s stale module doc claiming spread splitting has no implementation
-- [ ] 8.2 Fix `icc.rs`'s doc claiming a Flate filter is re-applied on output when the code writes raw samples; validate sample-length against width × height × channels, and state that `/Decode`, `/SMask`, and `/ImageMask` are unhandled
+- [x] 8.1 Fix `pipeline.rs`'s stale module doc claiming spread splitting has no implementation
+- [x] 8.2 Fix `icc.rs`'s doc claiming a Flate filter is re-applied on output when the code writes raw samples; validate sample-length against width × height × channels, and state that `/Decode`, `/SMask`, and `/ImageMask` are unhandled
 - [ ] 8.3 Collapse the three encodings of "which bindings have a spine" (`Binding::has_spine`, `cover_geometry`'s match, `spine_width`'s match) to one
 - [ ] 8.4 Mask `detected_tools[].path` and `tool_version` in `normalized_for_diff`, or document why two machines are expected to differ
 - [ ] 8.5 Reject `multiple == 0` and use `checked_add` in `PageCountRules::next_conformant`, or make its fields private
