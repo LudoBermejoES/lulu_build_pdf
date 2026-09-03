@@ -104,5 +104,5 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 - [x] 9.13 Add a form-XObject-with-indirect-resources fixture, asserting the correct image is found and its PPI is right (finding 20)
 - [x] 9.14 Add an aliased-page fixture (one page object in `/Kids` twice), asserting each output page is nested exactly once
 - [x] 9.15 Add CLI tests for `book --json` parseability, `--report-out` completeness, the write-failure exit code, invalid config values, and the full-SKU filename
-- [ ] 9.16 Regenerate the affected snapshots and review the diff line by line, treating it as the evidence that the checks now see through nesting rather than blanket-accepting it
+- [x] 9.16 Regenerate the affected snapshots and review the diff line by line, treating it as the evidence that the checks now see through nesting rather than blanket-accepting it
 - [x] 9.17 Extend `examples/generate_fixtures.rs` to build every fixture above, so the corpus stays reproducible from one command
