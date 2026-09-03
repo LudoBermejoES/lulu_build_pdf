@@ -56,6 +56,9 @@ pub mod codes {
     pub const PAGE_COUNT_ABOVE_MAXIMUM: &str = "page-count.above-maximum";
     pub const PAGE_COUNT_NOT_DIVISIBLE: &str = "page-count.not-divisible";
     pub const GUTTER_BELOW_ADVISORY_FLOOR: &str = "gutter.below-advisory-floor";
+    pub const GEOMETRY_UNRESOLVABLE_RESOURCES: &str = "geometry.unresolvable-resources";
+    pub const GEOMETRY_DEGENERATE: &str = "geometry.degenerate";
+    pub const GUTTER_EXCEEDS_SAFE_AREA: &str = "gutter.exceeds-safe-area";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

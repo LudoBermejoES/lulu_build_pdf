@@ -29,14 +29,14 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 3. Normalization correctness
 
-- [ ] 3.1 Use effective page resources when building the nested form, and refuse to substitute an empty dictionary
-- [ ] 3.2 Preflight the input as well as the output in `normalize_interior`, carrying forward every input finding that was not fixed, deduplicated by code plus page set
-- [ ] 3.3 Ensure a run carrying an unfixed blocking finding is not reported as print-ready and drives exit 1, so `check` and `interior` cannot disagree about the same file
-- [ ] 3.4 Refuse a non-finite or non-positive dimension in `fit_placement`, and assert every `cm` operand finite immediately before writing it
-- [ ] 3.5 Deduplicate or split page objects aliased more than once in `/Kids`, so a shared page is not nested repeatedly with compounding transforms and conflicting parity shifts
-- [ ] 3.6 Report when the gutter shift moves content outside the trim or safety rectangle
-- [ ] 3.7 Either implement `FitMode::StretchMargins`'s documented bleed fill or reject the mode as unimplemented; it must not remain a silent alias for `Center`
-- [ ] 3.8 Resolve the `/Names` tree when sanitizing, and make `SanitizeSummary` reflect what was actually removed
+- [x] 3.1 Use effective page resources when building the nested form, and refuse to substitute an empty dictionary
+- [x] 3.2 Preflight the input as well as the output in `normalize_interior`, carrying forward every input finding that was not fixed, deduplicated by code plus page set
+- [x] 3.3 Ensure a run carrying an unfixed blocking finding is not reported as print-ready and drives exit 1, so `check` and `interior` cannot disagree about the same file
+- [x] 3.4 Refuse a non-finite or non-positive dimension in `fit_placement`, and assert every `cm` operand finite immediately before writing it
+- [x] 3.5 Deduplicate or split page objects aliased more than once in `/Kids`, so a shared page is not nested repeatedly with compounding transforms and conflicting parity shifts
+- [x] 3.6 Report when the gutter shift moves content outside the trim or safety rectangle
+- [x] 3.7 Either implement `FitMode::StretchMargins`'s documented bleed fill or reject the mode as unimplemented; it must not remain a silent alias for `Center`
+- [x] 3.8 Resolve the `/Names` tree when sanitizing, and make `SanitizeSummary` reflect what was actually removed
 
 ## 4. Cover geometry
 
