@@ -281,7 +281,8 @@ fn apply_determinism(cli: &Cli, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     };
     let doc_id = parse_doc_id(doc_id_hex)?;
     let mut doc = lulu_prep::pdf::load_from_bytes(&bytes).map_err(|e| e.to_string())?;
-    lulu_prep::pdf::apply_deterministic_identity(&mut doc, doc_id, creation_date);
+    lulu_prep::pdf::apply_deterministic_identity(&mut doc, doc_id, creation_date)
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     doc.save_to(&mut out).map_err(|e| e.to_string())?;
     Ok(out)

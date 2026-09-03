@@ -4,17 +4,17 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 ## 1. Shared PDF object access
 
-- [ ] 1.1 Add `pdf::effective_page_resources(doc, page_id) -> Result<Dictionary, _>` resolving a page's `/Resources` when direct, when an indirect reference, and when inherited from any `Pages` ancestor, merging child over parent so a page's own entry wins over an inherited one of the same name
+- [x] 1.1 Add `pdf::effective_page_resources(doc, page_id) -> Result<Dictionary, _>` resolving a page's `/Resources` when direct, when an indirect reference, and when inherited from any `Pages` ancestor, merging child over parent so a page's own entry wins over an inherited one of the same name
 - [ ] 1.2 Route all six current resource reads through it: `normalize::nest_page`, `normalize::split_spread_pages`, `cover::copy_page_as_form`, `cover::extract_panel_as_preview_page`, `ctm_walk::walk_page_images` (including the form's own `/Resources`, which currently falls back to the page's), and `preflight`'s reads
-- [ ] 1.3 Make `pdf::rotation_degrees` dereference and accept `Real` as well as `Integer`, round to the nearest 90, and return a distinguishable "present but unreadable" or "not a multiple of 90" outcome instead of `unwrap_or(0)`
-- [ ] 1.4 Make `pdf::own_box_rect` / `as_rect_points` dereference both the box entry and each element of the array
-- [ ] 1.5 Add a shared accessor for the catalog's `/Names` tree that resolves an indirect reference and supports mutation through the referenced object, and use it in both `preflight::check_structure` and `normalize::sanitize_structure`
-- [ ] 1.6 Add a visited-set (or depth cap matching lopdf's page-tree limit) to `pdf::get_inherited` so a `/Parent` cycle terminates
-- [ ] 1.7 Convert `pdf::deep_copy_object` from recursion to an explicit worklist, or give it a depth budget, so a long reference chain cannot overflow the stack
-- [ ] 1.8 Fix `pdf::deep_copy_object` to keep the original `/Filter` and `/DecodeParms` and copy the bytes verbatim when `get_plain_content` fails, dropping the filter only when decoding actually succeeded
-- [ ] 1.9 Make `pdf::apply_deterministic_identity` report rather than swallow the case where `/Info` resolves to a non-dictionary, since silently skipping it defeats the reproducibility guarantee the function exists for
-- [ ] 1.10 Report a dangling `Object::Reference` encountered during a deep copy as a finding instead of silently substituting `Object::Null`
-- [ ] 1.11 Guard `units::Length` against `NaN` construction, and make `Rect::inset` refuse to produce an inverted rectangle
+- [x] 1.3 Make `pdf::rotation_degrees` dereference and accept `Real` as well as `Integer`, round to the nearest 90, and return a distinguishable "present but unreadable" or "not a multiple of 90" outcome instead of `unwrap_or(0)`
+- [x] 1.4 Make `pdf::own_box_rect` / `as_rect_points` dereference both the box entry and each element of the array
+- [x] 1.5 Add a shared accessor for the catalog's `/Names` tree that resolves an indirect reference and supports mutation through the referenced object, and use it in both `preflight::check_structure` and `normalize::sanitize_structure`
+- [x] 1.6 Add a visited-set (or depth cap matching lopdf's page-tree limit) to `pdf::get_inherited` so a `/Parent` cycle terminates
+- [x] 1.7 Convert `pdf::deep_copy_object` from recursion to an explicit worklist, or give it a depth budget, so a long reference chain cannot overflow the stack
+- [x] 1.8 Fix `pdf::deep_copy_object` to keep the original `/Filter` and `/DecodeParms` and copy the bytes verbatim when `get_plain_content` fails, dropping the filter only when decoding actually succeeded
+- [x] 1.9 Make `pdf::apply_deterministic_identity` report rather than swallow the case where `/Info` resolves to a non-dictionary, since silently skipping it defeats the reproducibility guarantee the function exists for
+- [x] 1.10 Report a dangling `Object::Reference` encountered during a deep copy as a finding instead of silently substituting `Object::Null`
+- [x] 1.11 Guard `units::Length` against `NaN` construction, and make `Rect::inset` refuse to produce an inverted rectangle
 
 ## 2. Preflight sees through nesting
 
