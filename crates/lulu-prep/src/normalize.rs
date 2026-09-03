@@ -225,60 +225,13 @@ pub fn page_boxes(required_size: Size) -> PageBoxes {
     }
 }
 
-/// Resolves a page's effective `/Resources`: its own dictionary, whether
-/// written directly or as an indirect reference, merged over any
-/// `/Resources` inherited from its `Pages` ancestors — the page's own
-/// top-level category keys (`Font`, `XObject`, `ColorSpace`, ...) win over
-/// an inherited category of the same name, matching PDF's own inheritance
-/// rule. This is the single accessor every form-XObject-building site in
-/// this file goes through, so a page whose `/Resources` is indirect or
-/// inherited — the shape essentially every real PDF producer emits — no
-/// longer loses every font and image it names
-/// (`specs/interior-normalization/spec.md`, "Nesting preserves the source
-/// page's effective resources").
-///
-/// Returns `Err(page_id)` only when a `/Resources` entry — the page's own
-/// or an inherited one — is present but does not resolve to a dictionary
-/// (e.g. a broken indirect reference). That is deliberately distinct from
-/// "no `/Resources` anywhere in the chain", which is a legitimately
-/// resource-free page (the blank pages this tool itself appends are
-/// exactly that) and resolves to an empty dictionary rather than an error.
-fn effective_page_resources(
-    doc: &lopdf::Document,
-    page_id: lopdf::ObjectId,
-) -> Result<lopdf::Dictionary, lopdf::ObjectId> {
-    let mut chain: Vec<&lopdf::Dictionary> = Vec::new();
-    let mut current = doc.get_dictionary(page_id).map_err(|_| page_id)?;
-    // A depth cap guards against a `/Parent` cycle — a malformed but
-    // possible input this walk must never hang on. 64 comfortably exceeds
-    // any plausible Pages-tree depth.
-    for _ in 0..64 {
-        chain.push(current);
-        let Ok(parent_id) = current.get(b"Parent").and_then(|o| o.as_reference()) else {
-            break;
-        };
-        let Ok(parent_dict) = doc.get_dictionary(parent_id) else {
-            break;
-        };
-        current = parent_dict;
-    }
-
-    let mut merged = lopdf::Dictionary::new();
-    for dict in chain.iter().rev() {
-        let Ok(resources_obj) = dict.get(b"Resources") else {
-            continue;
-        };
-        let resources_dict = match resources_obj {
-            lopdf::Object::Dictionary(d) => d,
-            lopdf::Object::Reference(id) => doc.get_dictionary(*id).map_err(|_| page_id)?,
-            _ => return Err(page_id),
-        };
-        for (key, value) in resources_dict.iter() {
-            merged.set(key.clone(), value.clone());
-        }
-    }
-    Ok(merged)
-}
+/// This file's own form-XObject-building sites resolve a page's effective
+/// `/Resources` through [`crate::pdf::effective_page_resources`] — the one
+/// shared accessor for this, so a page whose `/Resources` is indirect or
+/// inherited (the shape essentially every real PDF producer emits) never
+/// loses the fonts and images it names regardless of which call site reads
+/// it (`specs/interior-normalization/spec.md`, "Nesting preserves the
+/// source page's effective resources").
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpreadSplitError {
@@ -314,8 +267,8 @@ pub fn split_spread_pages(doc: &mut lopdf::Document) -> Result<u32, SpreadSplitE
         let height = own_rect.height();
 
         let content_bytes = doc.get_page_content(page_id);
-        let resources = effective_page_resources(doc, page_id)
-            .map_err(SpreadSplitError::UnresolvableResources)?;
+        let resources = crate::pdf::effective_page_resources(doc, page_id)
+            .map_err(|_| SpreadSplitError::UnresolvableResources(page_id))?;
         let form_dict = dictionary! {
             "Type" => "XObject",
             "Subtype" => "Form",
@@ -670,8 +623,8 @@ pub fn nest_page(
     // Resolved before any mutation below, so a page whose resources can't
     // be found is refused with `doc` left completely untouched for that
     // page, rather than partially rewritten.
-    let resources =
-        effective_page_resources(doc, page_id).map_err(NestError::UnresolvableResources)?;
+    let resources = crate::pdf::effective_page_resources(doc, page_id)
+        .map_err(|_| NestError::UnresolvableResources(page_id))?;
 
     let (rotate_matrix, rotated_size) = rotation_bake(rotation, own_size);
     let mut placement = fit_placement(rotated_size, required_size, fit_mode);
