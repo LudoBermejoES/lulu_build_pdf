@@ -82,9 +82,9 @@ Ordering matters: the shared accessors in group 1 are what groups 2–4 depend o
 
 - [x] 8.1 Fix `pipeline.rs`'s stale module doc claiming spread splitting has no implementation
 - [x] 8.2 Fix `icc.rs`'s doc claiming a Flate filter is re-applied on output when the code writes raw samples; validate sample-length against width × height × channels, and state that `/Decode`, `/SMask`, and `/ImageMask` are unhandled
-- [ ] 8.3 Collapse the three encodings of "which bindings have a spine" (`Binding::has_spine`, `cover_geometry`'s match, `spine_width`'s match) to one
-- [ ] 8.4 Mask `detected_tools[].path` and `tool_version` in `normalized_for_diff`, or document why two machines are expected to differ
-- [ ] 8.5 Reject `multiple == 0` and use `checked_add` in `PageCountRules::next_conformant`, or make its fields private
+- [x] 8.3 Collapse the three encodings of "which bindings have a spine" (`Binding::has_spine`, `cover_geometry`'s match, `spine_width`'s match) to one
+- [x] 8.4 Mask `detected_tools[].path` and `tool_version` in `normalized_for_diff`, or document why two machines are expected to differ
+- [x] 8.5 Reject `multiple == 0` and use `checked_add` in `PageCountRules::next_conformant`, or make its fields private
 - [ ] 8.6 Update the README where behaviour changes (fit modes, the new blocking findings, `book`'s report shape)
 
 ## 9. Test corpus for the shapes that hid these bugs

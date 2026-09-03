@@ -370,6 +370,16 @@ pub fn check_page_count(observed: u32, rules: &PageCountRules) -> Vec<Finding> {
             .with_expected(format!("<= {max}"))
             .fixable(false)]
         }
+        Err(crate::geometry::PageCountError::InvalidRules) => {
+            vec![
+                Finding::new(
+                    "page-count.invalid-rules",
+                    Severity::Blocking,
+                    "this product's page-count rules have no valid divisibility multiple, so no conformant page count could be determined".to_string(),
+                )
+                .fixable(false),
+            ]
+        }
     }
 }
 

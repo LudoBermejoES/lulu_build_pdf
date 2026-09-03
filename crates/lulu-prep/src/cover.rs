@@ -327,14 +327,29 @@ pub(crate) enum BindingPanelModel {
 }
 
 /// The single place that decides [`BindingPanelModel`] for a [`Binding`].
+///
+/// An exhaustive match rather than a derivation from [`Binding::has_spine`]:
+/// this needs a *finer* distinction than "has a spine or not" (case wrap and
+/// linen wrap both have one, but only one of them gets this crate's 3-panel
+/// treatment), so the exhaustiveness itself — not a shared boolean — is what
+/// keeps this from silently mis-handling a binding added later. The debug
+/// assertion below still ties the two together: a binding this function
+/// treats as spineless must agree with `has_spine()`, or one of them is wrong.
 pub(crate) fn binding_panel_model(binding: Binding) -> BindingPanelModel {
-    match binding {
+    let model = match binding {
         Binding::Perfect | Binding::SaddleStitch | Binding::Coil | Binding::WireO => {
             BindingPanelModel::Perfect
         }
         Binding::CaseWrap => BindingPanelModel::CaseWrap,
         Binding::LinenWrap => BindingPanelModel::UnsupportedDustJacket,
-    }
+    };
+    debug_assert!(
+        binding.has_spine() || matches!(model, BindingPanelModel::Perfect),
+        "{binding:?} has no spine per Binding::has_spine(), but binding_panel_model routed it \
+         somewhere other than the flat/spineless layout — this function and Binding::has_spine() \
+         have drifted apart"
+    );
+    model
 }
 
 /// Cover geometry for `entry` at its *final* interior page count (after

@@ -386,12 +386,17 @@ pub fn pad_pages(
     rules: &crate::geometry::PageCountRules,
 ) -> Result<Vec<u32>, PadError> {
     let current = doc.get_pages().len() as u32;
-    let target = rules.next_conformant(current).map_err(
-        |crate::geometry::PageCountError::AboveMaximum { requested, max }| PadError::AboveMaximum {
-            requested,
-            max,
-        },
-    )?;
+    let target = match rules.next_conformant(current) {
+        Ok(target) => target,
+        Err(crate::geometry::PageCountError::AboveMaximum { requested, max }) => {
+            return Err(PadError::AboveMaximum { requested, max });
+        }
+        // `rules.multiple` always comes from `Binding::page_count_multiple()`
+        // (2 or 4), never 0 — see `PageCountRules::from_catalog_entry`.
+        Err(crate::geometry::PageCountError::InvalidRules) => {
+            unreachable!("PageCountRules::from_catalog_entry never produces multiple == 0")
+        }
+    };
     if target == current {
         return Ok(Vec::new());
     }
@@ -869,11 +874,17 @@ pub fn normalize_interior(
     let rules = PageCountRules::from_catalog_entry(product);
 
     let original_count = doc.get_pages().len() as u32;
-    let final_count = rules.next_conformant(original_count).map_err(
-        |crate::geometry::PageCountError::AboveMaximum { requested, max }| {
-            NormalizeInteriorError::AboveMaximum { requested, max }
-        },
-    )?;
+    let final_count = match rules.next_conformant(original_count) {
+        Ok(count) => count,
+        Err(crate::geometry::PageCountError::AboveMaximum { requested, max }) => {
+            return Err(NormalizeInteriorError::AboveMaximum { requested, max });
+        }
+        // `rules.multiple` always comes from `Binding::page_count_multiple()`
+        // (2 or 4), never 0 — see `PageCountRules::from_catalog_entry`.
+        Err(crate::geometry::PageCountError::InvalidRules) => {
+            unreachable!("PageCountRules::from_catalog_entry never produces multiple == 0")
+        }
+    };
 
     let gutter_allowance = crate::geometry::gutter_allowance(final_count);
     let gutter_applied = options.apply_gutter.then_some(gutter_allowance.gutter);

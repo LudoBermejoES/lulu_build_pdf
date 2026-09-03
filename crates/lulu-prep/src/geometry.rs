@@ -63,6 +63,8 @@ pub fn gutter_allowance(page_count: u32) -> GutterAllowance {
 pub enum PageCountError {
     #[error("requested page count {requested} exceeds this product's maximum of {max}")]
     AboveMaximum { requested: u32, max: u32 },
+    #[error("page-count rules with a divisibility multiple of 0 have no conformant count")]
+    InvalidRules,
 }
 
 /// A product's page-count constraints: catalog minimum/maximum and the binding's
@@ -87,12 +89,26 @@ impl PageCountRules {
     /// and the binding's divisibility rule, or an error naming the maximum if no
     /// such count exists.
     pub fn next_conformant(&self, requested: u32) -> Result<u32, PageCountError> {
+        if self.multiple == 0 {
+            return Err(PageCountError::InvalidRules);
+        }
         let raised = requested.max(self.min);
         let remainder = raised % self.multiple;
         let padded = if remainder == 0 {
             raised
         } else {
-            raised + (self.multiple - remainder)
+            match raised.checked_add(self.multiple - remainder) {
+                Some(padded) => padded,
+                // Overflowing past u32::MAX has the same practical outcome as
+                // exceeding the product's maximum: no conformant count exists
+                // that this type can represent.
+                None => {
+                    return Err(PageCountError::AboveMaximum {
+                        requested,
+                        max: self.max,
+                    });
+                }
+            }
         };
         if padded > self.max {
             Err(PageCountError::AboveMaximum {
@@ -186,6 +202,13 @@ pub fn spine_width(
     page_count: u32,
     interior_ppi: Option<f64>,
 ) -> Result<SpineWidth, SpineError> {
+    // `Binding::has_spine` is the one place "which bindings have a printable
+    // spine at all" is decided; this function only chooses *how* to size one
+    // for the bindings that do, so the spineless case can never drift out of
+    // step with that decision.
+    if !binding.has_spine() {
+        return Ok(SpineWidth::None);
+    }
     match binding {
         Binding::Perfect => {
             let ppi = interior_ppi.ok_or(SpineError::MissingPpi)?;
@@ -195,7 +218,9 @@ pub fn spine_width(
         Binding::CaseWrap | Binding::LinenWrap => {
             hardcover_spine_width(page_count).map(SpineWidth::Hardcover)
         }
-        Binding::SaddleStitch | Binding::Coil | Binding::WireO => Ok(SpineWidth::None),
+        Binding::SaddleStitch | Binding::Coil | Binding::WireO => unreachable!(
+            "has_spine() already returned false for these bindings and routed them through the early return above"
+        ),
     }
 }
 
@@ -336,6 +361,35 @@ mod tests {
             PageCountError::AboveMaximum {
                 requested: 812,
                 max: 800
+            }
+        );
+    }
+
+    #[test]
+    fn zero_multiple_is_an_error_not_a_panic() {
+        let rules = PageCountRules {
+            min: 0,
+            max: 800,
+            multiple: 0,
+        };
+        let err = rules.next_conformant(50).unwrap_err();
+        assert_eq!(err, PageCountError::InvalidRules);
+    }
+
+    #[test]
+    fn a_padding_amount_that_would_wrap_past_u32_max_errors_rather_than_overflowing() {
+        // u32::MAX - 1, padded up to the next multiple of 4, wraps past u32::MAX.
+        let rules = PageCountRules {
+            min: 0,
+            max: 10,
+            multiple: 4,
+        };
+        let err = rules.next_conformant(u32::MAX - 1).unwrap_err();
+        assert_eq!(
+            err,
+            PageCountError::AboveMaximum {
+                requested: u32::MAX - 1,
+                max: 10
             }
         );
     }

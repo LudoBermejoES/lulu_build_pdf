@@ -300,9 +300,16 @@ impl Report {
         serde_json::to_string_pretty(self)
     }
 
-    /// A copy of this report's JSON with every volatile field masked out —
-    /// `generated_at`, stage durations, and detected-tool versions — so two
-    /// runs of the same input can be compared for a genuine difference.
+    /// A copy of this report's JSON with every field that varies by *machine*
+    /// rather than by *input* masked out — `generated_at`, stage durations,
+    /// and each detected tool's version and install path — so two runs of
+    /// the same input on different machines diff as identical.
+    ///
+    /// `tool_version` (this crate's own version) is deliberately left
+    /// unmasked: unlike the fields above, it does not vary machine-to-machine
+    /// for a fixed build, and a diff caused by it is exactly the signal that
+    /// two reports were produced by different versions of this tool — worth
+    /// seeing, not noise to hide.
     pub fn normalized_for_diff(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).expect("Report always serializes");
         if let Some(obj) = value.as_object_mut() {
@@ -318,6 +325,12 @@ impl Report {
                 for tool in tools {
                     if let Some(tool_obj) = tool.as_object_mut() {
                         tool_obj.insert("version".to_string(), serde_json::Value::Null);
+                        // A tool's install path (`/usr/bin/qpdf` vs.
+                        // `/opt/homebrew/bin/qpdf`) is a property of the
+                        // machine that ran the tool, not of the input — two
+                        // machines with the same tool at different paths
+                        // should diff as identical.
+                        tool_obj.insert("path".to_string(), serde_json::Value::Null);
                     }
                 }
             }
@@ -479,7 +492,7 @@ mod tests {
         });
         run2.detected_tools.push(DetectedTool {
             name: "qpdf".to_string(),
-            path: Some("/usr/bin/qpdf".to_string()),
+            path: Some("/opt/homebrew/bin/qpdf".to_string()),
             version: Some("11.9.1".to_string()),
         });
 
