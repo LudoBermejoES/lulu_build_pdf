@@ -221,6 +221,81 @@ gs -dNOPAUSE -dBATCH -dSAFER -sDEVICE=pdfwrite \
 Re-run `lulu-prep check` after any Ghostscript pass — confirm `0 blocking
 findings` before touching Lulu again.
 
+## Building a wrap cover when there's no existing spine art
+
+When a source book only has a front cover (page 1) and a back cover (its
+last page) — the common case for these PDFs — there's no ready-made
+back+spine+front wrap, and `lulu-prep cover`'s CLI only accepts one already-
+assembled single-page `--supplied` file. The library itself has everything
+needed to do this properly (`lulu_prep::cover::assemble_three_panel_cover`,
+`cover_geometry_from_interior`, `apply_cover_structural_rules`,
+`preflight_cover`); it's just not exposed as a CLI flag. Rather than hand-
+deriving panel geometry (which the crate's own spec explicitly forbids — see
+`openspec/specs/cover-preparation/spec.md`), use it directly:
+
+- `crates/lulu-prep/examples/cover_builder.rs` — a small example binary
+  (`cargo build --release --example cover_builder -p lulu-prep`) that:
+  1. Looks up the SKU's `CatalogEntry` and calls `cover_geometry_from_interior`
+     against the *normalized* interior file, so the spine width can never
+     drift from the book's real final page count.
+  2. Pads the supplied front/back single pages out to the exact panel size
+     Lulu requires — bleed goes entirely on the outer edge (left for back,
+     right for front, never on the fold-facing edge) and is split evenly
+     top/bottom, filled with a caller-supplied solid colour. The amount to
+     pad is derived from each page's own measured size, not assumed to be
+     exactly one bleed constant — real source covers vary (one book's back
+     cover was already sized with its own partial bleed baked in).
+     **Gotcha**: `own_box_rect`'s fallback chain is `BleedBox -> CropBox ->
+     MediaBox`; a supplied page that already carries a `BleedBox` will shadow
+     a freshly-set `MediaBox` unless that `BleedBox` (and `CropBox`/`TrimBox`/
+     `ArtBox`) is removed first.
+  3. Builds the spine panel from a plain JPEG (avoids any font-embedding
+     question entirely — it's pixels, not text) sized exactly to
+     `geo.spine`'s point dimensions via an explicit `cm` scale in its content
+     stream, so there's no DPI-rounding mismatch against the required panel
+     size.
+  4. Assembles all three, applies structural rules, then **validates the
+     result with `preflight_cover(bytes, entry, geo.canvas)`** (not the
+     generic `check` command — that has no cover mode and will misjudge a
+     single-page cover as a tiny, wrong-sized interior) and reports its own
+     blocking-finding count.
+  - Usage: `cover_builder <sku> <interior.pdf> <front.pdf> <back.pdf> <back_r> <back_g> <back_b> <front_r> <front_g> <front_b> <spine.jpg> <spine_px_w> <spine_px_h> <out.pdf>`
+  - A `cover.panel-size-mismatch` finding printed by `assemble_three_panel_cover`
+    itself (as opposed to `preflight_cover`) is only informational: the
+    assembly step always clips each panel to its destination rectangle
+    regardless, so an oversized supplied panel is simply cropped correctly;
+    only trust `preflight_cover`'s own blocking count as the real gate.
+
+- A companion Python script (pattern: sample the source cover's own edge
+  pixel colour with `pdftoppm` + Pillow, render the book's title rotated 90°
+  with `ImageDraw`, shrinking the font until it fits the spine's width) builds
+  the spine JPEG and prints the sampled back/front edge colours for the Rust
+  tool to reuse as the bleed-fill colour on each side — this keeps the wrap's
+  fold seams close to seamless without any manual design work. Not committed
+  anywhere permanent; recreate it from this description (it's about 70 lines)
+  if doing another batch — the exact recipe isn't load-bearing enough to be
+  worth a permanent script, but the two things that *do* matter are: sample
+  colour from the correct edge (left of the back cover, right of the front
+  cover — the edges each panel's own bleed extends from), and fit the font by
+  shrinking until `text_h <= spine_width_px * 0.88` (text height becomes the
+  rotated width) — a narrow spine (a 12-page zine can have a spine under
+  0.15in) needs a genuinely tiny font, not a clipped large one.
+
+- Extract the front/back single pages from the source book with
+  `qpdf src.pdf --pages src.pdf 1 -- front.pdf` (and the source's own last
+  page number for the back), and get the exact spine width/canvas for the
+  book's *final* (post-padding) page count with
+  `lulu-prep spine --sku <SKU> --pages <N>` — never hand-compute this either.
+
+- Extracted front/back pages carry over whatever font-embedding problems the
+  source itself has. If the source is a fully standard-fonts document (an
+  entirely non-embedded-font book, not just an OCR layer — `pdffonts` shows
+  every font as the classic base-14 names, `emb=no`), the front/back cover
+  pages need the same Ghostscript `-c "<< /NeverEmbed [ ] >> setdistillerparams"
+  -f` pass as the interior *before* being handed to `cover_builder` — fixing
+  only the interior and leaving the raw extracted cover pages unfixed still
+  fails `preflight_cover`'s own font-embedding check.
+
 ## Operational notes / gotchas
 
 - The wizard's top-of-page nav has two rows that look similar at a glance:
