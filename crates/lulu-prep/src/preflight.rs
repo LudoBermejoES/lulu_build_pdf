@@ -27,6 +27,18 @@ fn resolve_dict_local<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a D
     }
 }
 
+/// `object`, dereferenced one level if it is an [`Object::Reference`], as an
+/// array — a composite (`Type0`) font's `/DescendantFonts` is legally either
+/// a direct array or an indirect reference to one, and at least one real
+/// producer emits the indirect form.
+fn resolve_array_local<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Vec<Object>> {
+    match object {
+        Object::Reference(id) => doc.get_object(*id).ok().and_then(|o| o.as_array().ok()),
+        Object::Array(arr) => Some(arr),
+        _ => None,
+    }
+}
+
 /// PDF page-size comparisons tolerate up to this much slack — Lulu's own
 /// stated tolerance for "close enough" geometry.
 const SIZE_TOLERANCE: Length = Length::from_points(0.5);
@@ -275,7 +287,7 @@ fn check_fonts_in_resources(
             font_dict
                 .get(b"DescendantFonts")
                 .ok()
-                .and_then(|o| o.as_array().ok())
+                .and_then(|o| resolve_array_local(doc, o))
                 .and_then(|arr| arr.first())
                 .and_then(|o| resolve_dict_local(doc, o))
                 .and_then(|descendant| descendant.get(b"FontDescriptor").ok())
@@ -1494,6 +1506,41 @@ mod tests {
         let findings = check_font_embedding(&not_embedded, &page_ids);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].code, codes::FONTS_NOT_EMBEDDED);
+    }
+
+    /// Real-world regression: at least one producer emits a composite font's
+    /// `/DescendantFonts` as an indirect reference to the array rather than
+    /// the array inline. Before `resolve_array_local`, this silently failed
+    /// to resolve and preflight reported a genuinely embedded font as
+    /// missing (a false-positive blocking finding).
+    #[test]
+    fn composite_font_descendant_fonts_as_indirect_reference_is_resolved() {
+        let mut doc = doc_with_composite_font(true);
+        let type0_id = doc
+            .objects
+            .keys()
+            .find(|id| {
+                doc.get_dictionary(**id)
+                    .ok()
+                    .and_then(|d| d.get(b"Subtype").ok())
+                    .and_then(|o| o.as_name().ok())
+                    == Some(b"Type0".as_slice())
+            })
+            .copied()
+            .expect("Type0 font object exists");
+        let descendant_array = doc
+            .get_dictionary(type0_id)
+            .unwrap()
+            .get(b"DescendantFonts")
+            .unwrap()
+            .clone();
+        let indirect_array_id = doc.add_object(descendant_array);
+        doc.get_dictionary_mut(type0_id)
+            .unwrap()
+            .set("DescendantFonts", Object::Reference(indirect_array_id));
+
+        let page_ids: Vec<_> = doc.page_iter().collect();
+        assert!(check_font_embedding(&doc, &page_ids).is_empty());
     }
 
     // --- page count ---
